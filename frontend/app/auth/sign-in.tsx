@@ -52,7 +52,7 @@ export default function SignIn() {
           <View style={styles.header}>
             <View style={styles.badge}>
               <Ionicons name="football" size={18} color={theme.colors.brandSecondary} />
-              <Text style={styles.badgeText}>SERIE A · 2025/26</Text>
+              <Text style={styles.badgeText}>CAMPIONATO ITALIANO · 2025/26</Text>
             </View>
             <Text style={styles.title}>Fantacalcio{'\n'}Manager</Text>
             <Text style={styles.subtitle}>

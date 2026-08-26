@@ -15,17 +15,23 @@ from pathlib import Path
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional, Literal
 from passlib.context import CryptContext
+import json as _json
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ['DB_NAME']
-JWT_SECRET = os.environ.get("JWT_SECRET", "fantacalcio-dev-secret-change-me")
+JWT_SECRET = os.environ.get("JWT_SECRET")
+if not JWT_SECRET or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "JWT_SECRET env variable is REQUIRED and must be at least 32 chars. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
+    )
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 7  # 7 days
 
-SEED_VERSION = 2  # bump to force re-seed of leagues/memberships/standings
+SEED_VERSION = 4  # bump to force re-seed of players from official listone
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -182,6 +188,23 @@ async def get_current_user(token: str = Depends(oauth2)) -> dict:
         raise creds_err
     return user
 
+
+async def require_membership(league_id: str, user: dict) -> dict:
+    """Ensure the given user is a member of the league. Returns the membership doc."""
+    m = await db.memberships.find_one(
+        {"league_id": league_id, "user_id": user["id"]}, {"_id": 0}
+    )
+    if not m:
+        raise HTTPException(403, "Non sei membro di questa lega")
+    return m
+
+
+async def require_admin(league_id: str, user: dict) -> dict:
+    m = await require_membership(league_id, user)
+    if m.get("role") != "admin":
+        raise HTTPException(403, "Solo l'amministratore della lega può eseguire questa operazione")
+    return m
+
 async def create_league_for_user(user: dict, league_name: str, team_name: str) -> dict:
     league_id = str(uuid.uuid4())
     code = await gen_invite_code()
@@ -323,6 +346,7 @@ async def my_leagues(current=Depends(get_current_user)):
 
 @api.get("/leagues/{league_id}", response_model=League)
 async def get_league(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
     if not l:
         raise HTTPException(404, "Lega non trovata")
@@ -330,6 +354,7 @@ async def get_league(league_id: str, current=Depends(get_current_user)):
 
 @api.get("/leagues/{league_id}/members", response_model=List[Membership])
 async def league_members(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     cursor = db.memberships.find({"league_id": league_id}, {"_id": 0}).sort("joined_at", 1)
     return [Membership(**m) for m in await cursor.to_list(100)]
 
@@ -351,9 +376,9 @@ async def list_players(role: Optional[Role] = None, q: Optional[str] = None):
     if role:
         query["role"] = role
     if q:
-        query["name"] = {"$regex": q, "$options": "i"}
+        query["name"] = {"$regex": re.escape(q[:64]), "$options": "i"}
     cursor = db.players.find(query, {"_id": 0}).sort("price", -1)
-    return [Player(**p) for p in await cursor.to_list(500)]
+    return [Player(**p) for p in await cursor.to_list(1000)]
 
 @api.get("/players/{player_id}", response_model=Player)
 async def get_player(player_id: str):
@@ -367,6 +392,7 @@ async def get_player(player_id: str):
 # ------------------------------------------------------------
 @api.get("/auction/{league_id}/state", response_model=AuctionState)
 async def auction_state(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     st = await db.auction_state.find_one({"league_id": league_id}, {"_id": 0})
     if not st:
         first_player = await db.players.find_one({}, {"_id": 0})
@@ -383,6 +409,7 @@ async def auction_state(league_id: str, current=Depends(get_current_user)):
 
 @api.get("/auction/{league_id}/bids", response_model=List[Bid])
 async def auction_bids(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     cursor = db.bids.find({"league_id": league_id}, {"_id": 0}).sort("created_at", -1).limit(50)
     return [Bid(**b) for b in await cursor.to_list(50)]
 
@@ -431,6 +458,7 @@ class NextPlayerRequest(BaseModel):
 
 @api.post("/auction/{league_id}/next", response_model=AuctionState)
 async def next_player(league_id: str, body: NextPlayerRequest, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
     p = await db.players.find_one({"id": body.player_id}, {"_id": 0})
     if not p:
         raise HTTPException(404, "Giocatore non trovato")
@@ -454,6 +482,7 @@ async def next_player(league_id: str, body: NextPlayerRequest, current=Depends(g
 # ------------------------------------------------------------
 @api.get("/regulations/{league_id}", response_model=Regulations)
 async def get_regulations(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     r = await db.regulations.find_one({"league_id": league_id}, {"_id": 0})
     if not r:
         r = Regulations(league_id=league_id).model_dump()
@@ -462,6 +491,7 @@ async def get_regulations(league_id: str, current=Depends(get_current_user)):
 
 @api.put("/regulations/{league_id}", response_model=Regulations)
 async def update_regulations(league_id: str, body: Regulations, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
     body_dict = body.model_dump()
     body_dict["league_id"] = league_id
     await db.regulations.update_one(
@@ -476,6 +506,7 @@ async def update_regulations(league_id: str, body: Regulations, current=Depends(
 # ------------------------------------------------------------
 @api.get("/standings/{league_id}", response_model=List[StandingRow])
 async def standings(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     cursor = db.standings.find({"league_id": league_id}, {"_id": 0}).sort("points", -1)
     rows = await cursor.to_list(50)
     # backfill team_name from memberships if missing
@@ -497,6 +528,7 @@ async def standings(league_id: str, current=Depends(get_current_user)):
 
 @api.get("/activity/{league_id}", response_model=List[Activity])
 async def activity(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     cursor = db.activity.find({"league_id": league_id}, {"_id": 0}).sort("created_at", -1).limit(30)
     items = await cursor.to_list(30)
     return [Activity(**a) for a in items]
@@ -515,6 +547,7 @@ class DashboardSummary(BaseModel):
 
 @api.get("/dashboard/{league_id}", response_model=DashboardSummary)
 async def dashboard(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
     l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
     if not l:
         raise HTTPException(404, "Lega non trovata")
@@ -546,228 +579,27 @@ async def dashboard(league_id: str, current=Depends(get_current_user)):
 # ------------------------------------------------------------
 # Seed
 # ------------------------------------------------------------
-SEED_PLAYERS = [
-    # === PORTIERI ===
-    ("Mike Maignan", "Milan", "P", 20),
-    ("Mile Svilar", "Roma", "P", 22),
-    ("Marco Carnesecchi", "Atalanta", "P", 20),
-    ("Josep Martinez", "Inter", "P", 20),
-    ("Jean Butez", "Como", "P", 19),
-    ("Alex Meret", "Napoli", "P", 16),
-    ("David De Gea", "Fiorentina", "P", 14),
-    ("Lukasz Skorupski", "Bologna", "P", 14),
-    ("Wladimiro Falcone", "Lecce", "P", 13),
-    ("Elia Caprile", "Cagliari", "P", 13),
-    ("Michele Di Gregorio", "Juventus", "P", 12),
-    ("Maduka Okoye", "Udinese", "P", 12),
-    ("Zion Suzuki", "Parma", "P", 11),
-    ("Justin Bijlow", "Genoa", "P", 11),
-    ("Arijanet Muric", "Sassuolo", "P", 9),
-    ("Alberto Paleari", "Torino", "P", 5),
-    ("Ivan Provedel", "Lazio", "P", 3),
-    ("Lorenzo Montipò", "Verona", "P", 2),
-    ("Simone Scuffet", "Pisa", "P", 2),
-    ("Marco Silvestri", "Cremonese", "P", 1),
 
-    # === DIFENSORI ===
-    ("Bremer", "Juventus", "D", 24),
-    ("Alessandro Bastoni", "Inter", "D", 21),
-    ("Manuel Akanji", "Inter", "D", 21),
-    ("Yann Bisseck", "Inter", "D", 20),
-    ("Strahinja Pavlovic", "Milan", "D", 20),
-    ("Gianluca Mancini", "Roma", "D", 20),
-    ("Giovanni Di Lorenzo", "Napoli", "D", 19),
-    ("Amir Rrahmani", "Napoli", "D", 19),
-    ("Pierre Kalulu", "Juventus", "D", 18),
-    ("Evan Ndicka", "Roma", "D", 18),
-    ("Oumar Solet", "Udinese", "D", 18),
-    ("Mario Gila", "Lazio", "D", 15),
-    ("Jacobo Ramon", "Como", "D", 15),
-    ("Leo Ostigard", "Genoa", "D", 15),
-    ("Isak Hien", "Atalanta", "D", 13),
-    ("Johan Vasquez", "Genoa", "D", 13),
-    ("Mario Hermoso", "Roma", "D", 13),
-    ("Davide Zappacosta", "Atalanta", "D", 13),
-    ("Alessandro Buongiorno", "Napoli", "D", 12),
-    ("Matteo Gabbia", "Milan", "D", 12),
-    ("Juan Miranda", "Bologna", "D", 12),
-    ("Davide Bartesaghi", "Milan", "D", 12),
-    ("Yerry Mina", "Cagliari", "D", 11),
-    ("Jhon Lucumi", "Bologna", "D", 11),
-    ("Adam Marusic", "Lazio", "D", 10),
-    ("Fikayo Tomori", "Milan", "D", 10),
-    ("Alessio Romagnoli", "Lazio", "D", 10),
-    ("Enrico Del Prato", "Parma", "D", 10),
-    ("Mergim Vojvoda", "Como", "D", 10),
-    ("Berat Djimsiti", "Atalanta", "D", 9),
-    ("Raoul Bellanova", "Atalanta", "D", 9),
-    ("Sam Beukema", "Napoli", "D", 9),
-    ("Pietro Comuzzo", "Fiorentina", "D", 9),
-    ("Thomas Kristensen", "Udinese", "D", 9),
-    ("Jay Idzes", "Sassuolo", "D", 9),
-    ("Ardian Ismajli", "Torino", "D", 9),
-    ("Nadir Zortea", "Bologna", "D", 9),
-    ("Emil Holm", "Juventus", "D", 9),
-    ("Honest Ahanor", "Atalanta", "D", 9),
-    ("Devyne Rensch", "Roma", "D", 9),
-    ("Miguel Gutierrez", "Napoli", "D", 9),
-    ("Alessandro Circati", "Parma", "D", 8),
-    ("Mathias Olivera", "Napoli", "D", 8),
-    ("Christian Kabasele", "Udinese", "D", 8),
-    ("Luca Ranieri", "Fiorentina", "D", 7),
-    ("Martin Vitik", "Bologna", "D", 7),
-    ("Marin Pongracic", "Fiorentina", "D", 7),
-    ("Fabiano Parisi", "Fiorentina", "D", 7),
-    ("Koni De Winter", "Milan", "D", 7),
-    ("Lautaro Valenti", "Parma", "D", 7),
-    ("Gabriele Zappa", "Cagliari", "D", 7),
-    ("Odilon Kossounou", "Atalanta", "D", 7),
-    ("Sead Kolasinac", "Atalanta", "D", 6),
-    ("Federico Gatti", "Juventus", "D", 6),
-    ("Nicolò Bertola", "Udinese", "D", 6),
-    ("Sebastiano Luperto", "Cremonese", "D", 2),
+LISTONE_PATH = ROOT_DIR / "data" / "players_listone.json"
 
-    # === CENTROCAMPISTI (include ali e ruoli 'CS/CD/AD' del Classic) ===
-    ("Hakan Calhanoglu", "Inter", "C", 38),
-    ("Scott McTominay", "Napoli", "C", 38),
-    ("Adrien Rabiot", "Milan", "C", 32),
-    ("Kevin De Bruyne", "Napoli", "C", 31),
-    ("Martin Baturina", "Como", "C", 31),
-    ("Federico Dimarco", "Inter", "C", 30),
-    ("Nicolò Barella", "Inter", "C", 26),
-    ("Weston McKennie", "Juventus", "C", 24),
-    ("Nikola Vlasic", "Torino", "C", 24),
-    ("Ederson", "Atalanta", "C", 21),
-    ("Wesley", "Roma", "C", 21),
-    ("Manu Kone", "Roma", "C", 20),
-    ("Matteo Politano", "Napoli", "C", 20),
-    ("Lorenzo Pellegrini", "Roma", "C", 20),
-    ("Piotr Zielinski", "Inter", "C", 20),
-    ("André-Frank Zambo Anguissa", "Napoli", "C", 19),
-    ("Lazar Samardzic", "Atalanta", "C", 19),
-    ("Khephren Thuram", "Juventus", "C", 18),
-    ("Alexis Saelemaekers", "Milan", "C", 17),
-    ("Cesare Casadei", "Torino", "C", 17),
-    ("Tommaso Baldanzi", "Genoa", "C", 17),
-    ("Kristian Thorstvedt", "Sassuolo", "C", 17),
-    ("Maximo Perrone", "Como", "C", 17),
-    ("Jurgen Ekkelenkamp", "Udinese", "C", 16),
-    ("Petar Sucic", "Inter", "C", 16),
-    ("Mario Pasalic", "Atalanta", "C", 16),
-    ("Andrea Cambiaso", "Juventus", "C", 15),
-    ("Nicolò Fagioli", "Fiorentina", "C", 15),
-    ("Eljif Elmas", "Napoli", "C", 15),
-    ("Rolando Mandragora", "Fiorentina", "C", 15),
-    ("Davide Frattesi", "Inter", "C", 14),
-    ("Bryan Cristante", "Roma", "C", 14),
-    ("Federico Bernardeschi", "Bologna", "C", 14),
-    ("Manuel Locatelli", "Juventus", "C", 14),
-    ("Stanislav Lobotka", "Napoli", "C", 14),
-    ("Gianluca Gaetano", "Cagliari", "C", 14),
-    ("Nicolò Cambiaghi", "Bologna", "C", 14),
-    ("Adrian Bernabé", "Parma", "C", 14),
-    ("Lewis Ferguson", "Bologna", "C", 14),
-    ("Matteo Cancellieri", "Lazio", "C", 14),
-    ("Ismaël Koné", "Sassuolo", "C", 14),
-    ("Nicola Zalewski", "Atalanta", "C", 12),
-    ("Henrikh Mkhitaryan", "Inter", "C", 12),
-    ("Morten Frendrup", "Genoa", "C", 12),
-    ("Nemanja Matic", "Sassuolo", "C", 11),
-    ("Tommaso Pobega", "Bologna", "C", 11),
-    ("Ndary Adopo", "Cagliari", "C", 11),
-    ("Jacopo Fazzini", "Fiorentina", "C", 11),
-    ("Marten De Roon", "Atalanta", "C", 10),
-    ("Nicolo Rovella", "Lazio", "C", 10),
-    ("Youssouf Fofana", "Milan", "C", 10),
-    ("Teun Koopmeiners", "Juventus", "C", 10),
-    ("Carlos Augusto", "Inter", "C", 10),
-    ("Lassana Coulibaly", "Lecce", "C", 10),
-    ("Ardon Jashari", "Milan", "C", 10),
-    ("Ruben Loftus-Cheek", "Milan", "C", 9),
-    ("Nuno Tavares", "Lazio", "C", 9),
-    ("Antonino Gallo", "Lecce", "C", 9),
-    ("Danilo Cataldi", "Lazio", "C", 8),
-    ("Simon Sohm", "Bologna", "C", 8),
-    ("Michael Folorunsho", "Cagliari", "C", 7),
-    ("Fabio Miretti", "Juventus", "C", 7),
-    ("Samuele Ricci", "Milan", "C", 7),
-    ("Marco Brescianini", "Fiorentina", "C", 7),
-    ("Neil El Aynaoui", "Roma", "C", 7),
-    ("Yunus Musah", "Atalanta", "C", 5),
-    ("Alessandro Deiola", "Cagliari", "C", 5),
-    ("Reda Belahyane", "Lazio", "C", 3),
 
-    # === ATTACCANTI (include Ali/Trequartisti del Classic) ===
-    ("Donyell Malen", "Roma", "A", 58),
-    ("Lautaro Martinez", "Inter", "A", 54),
-    ("Rasmus Højlund", "Napoli", "A", 46),
-    ("Marcus Thuram", "Inter", "A", 46),
-    ("Nico Paz", "Como", "A", 42),
-    ("Moise Kean", "Fiorentina", "A", 41),
-    ("Christian Pulisic", "Milan", "A", 37),
-    ("Tasos Douvikas", "Como", "A", 37),
-    ("Kenan Yildiz", "Juventus", "A", 35),
-    ("Gianluca Scamacca", "Atalanta", "A", 34),
-    ("Riccardo Orsolini", "Bologna", "A", 34),
-    ("Nikola Krstovic", "Atalanta", "A", 32),
-    ("Keinan Davis", "Udinese", "A", 32),
-    ("Domenico Berardi", "Sassuolo", "A", 30),
-    ("Paulo Dybala", "Roma", "A", 30),
-    ("Rafael Leao", "Milan", "A", 29),
-    ("Francesco Pio Esposito", "Inter", "A", 29),
-    ("Charles De Ketelaere", "Atalanta", "A", 28),
-    ("Nicolò Zaniolo", "Udinese", "A", 28),
-    ("Giovanni Simeone", "Torino", "A", 28),
-    ("Mattia Zaccagni", "Lazio", "A", 27),
-    ("Armand Laurienté", "Sassuolo", "A", 27),
-    ("Santiago Castro", "Bologna", "A", 27),
-    ("Andrea Pinamonti", "Sassuolo", "A", 26),
-    ("Lucas Da Cunha", "Como", "A", 26),
-    ("Giacomo Raspadori", "Atalanta", "A", 25),
-    ("Albert Gudmundsson", "Fiorentina", "A", 24),
-    ("Matias Soulé", "Roma", "A", 23),
-    ("Artem Dovbyk", "Roma", "A", 23),
-    ("Christopher Nkunku", "Milan", "A", 23),
-    ("Sebastiano Esposito", "Cagliari", "A", 22),
-    ("Francisco Conceicao", "Juventus", "A", 22),
-    ("Assane Diao", "Como", "A", 21),
-    ("Jesús Rodríguez", "Como", "A", 21),
-    ("Jonathan Rowe", "Bologna", "A", 21),
-    ("Lorenzo Colombo", "Genoa", "A", 20),
-    ("Romelu Lukaku", "Napoli", "A", 19),
-    ("Jonathan David", "Juventus", "A", 18),
-    ("Che Adams", "Torino", "A", 18),
-    ("Duvan Zapata", "Torino", "A", 16),
-    ("Roberto Piccoli", "Fiorentina", "A", 16),
-    ("Vitinha", "Genoa", "A", 16),
-    ("Ange-Yoan Bonny", "Inter", "A", 15),
-    ("Gustav Isaksen", "Lazio", "A", 15),
-    ("Petar Ratkov", "Lazio", "A", 15),
-    ("Nikola Stulic", "Lecce", "A", 15),
-    ("Boulaye Dia", "Lazio", "A", 14),
-    ("Mateo Pellegrino", "Parma", "A", 14),
-    ("David Neres", "Napoli", "A", 14),
-    ("Alisson Santos", "Napoli", "A", 14),
-    ("Jeremie Boga", "Juventus", "A", 13),
-    ("Kamaldeen Sulemana", "Atalanta", "A", 12),
-    ("Tijjani Noslin", "Lazio", "A", 12),
-    ("Santiago Pierotti", "Lecce", "A", 12),
-    ("Santiago Gimenez", "Milan", "A", 11),
-    ("Edon Zhegrova", "Juventus", "A", 11),
-    ("Jayden Addai", "Como", "A", 10),
-    ("Giovane", "Napoli", "A", 10),
-    ("Alvaro Morata", "Como", "A", 9),
-    ("Ondrej Ondrejka", "Parma", "A", 9),
-    ("Luis Henrique", "Inter", "A", 9),
-    ("Alieu Fadera", "Sassuolo", "A", 7),
-    ("Nicolas Kuhn", "Como", "A", 7),
-    ("Junior Messias", "Genoa", "A", 6),
-    ("Stephan El Shaarawy", "Roma", "A", 6),
-    ("Andrea Belotti", "Cagliari", "A", 6),
-    ("Jack Harrison", "Fiorentina", "A", 6),
-    ("Riccardo Sottil", "Lecce", "A", 5),
-    ("Robinio Vaz", "Roma", "A", 5),
-]
+def load_official_listone() -> List[tuple]:
+    """Load the official Fantacampionato listone (Nome | Squadra | Ruolo | QI)."""
+    if not LISTONE_PATH.exists():
+        logging.warning("Official listone file not found at %s", LISTONE_PATH)
+        return []
+    with LISTONE_PATH.open("r", encoding="utf-8") as f:
+        data = _json.load(f)
+    result = []
+    for row in data:
+        result.append((
+            row["name"],
+            row["team"],
+            row["role"],
+            int(row.get("price", 1)),
+        ))
+    return result
+
 
 DEMO_MEMBERS = [
     ("mario.rossi@fanta.it", "Mario Rossi", "Roma Devils"),
@@ -808,21 +640,25 @@ async def seed():
         await db.bids.drop()
         await ensure_indexes()
 
-    # Players
+    # Players — official listone loaded from JSON file
     if await db.players.count_documents({}) == 0:
-        docs = []
-        random.seed(42)
-        for i, (name, team, role, price) in enumerate(SEED_PLAYERS):
-            avg_vote = round(5.8 + min(price, 40) / 100.0 + random.random() * 0.4, 2)
-            docs.append({
-                "id": f"p{i+1:03d}",
-                "name": name, "team": team, "role": role, "price": price,
-                "avg_vote": avg_vote,
-                "goals": random.randint(2, 15) if role in ("A", "C") and price >= 15 else random.randint(0, 4),
-                "assists": random.randint(0, 10) if price >= 12 else random.randint(0, 4),
-            })
-        await db.players.insert_many(docs)
-        logging.info("Seeded %d players", len(docs))
+        listone = load_official_listone()
+        if not listone:
+            logging.error("Cannot seed players: listone is empty!")
+        else:
+            docs = []
+            random.seed(42)
+            for i, (name, team, role, price) in enumerate(listone):
+                avg_vote = round(5.8 + min(price, 60) / 120.0 + random.random() * 0.35, 2)
+                docs.append({
+                    "id": f"p{i+1:04d}",
+                    "name": name, "team": team, "role": role, "price": price,
+                    "avg_vote": avg_vote,
+                    "goals": random.randint(2, 20) if role in ("A", "C") and price >= 20 else random.randint(0, 5),
+                    "assists": random.randint(0, 12) if price >= 15 else random.randint(0, 4),
+                })
+            await db.players.insert_many(docs)
+            logging.info("Seeded %d players from official listone", len(docs))
 
     # Seed users (demo + members)
     demo_email, demo_name, demo_team = DEMO_ADMIN
@@ -858,7 +694,7 @@ async def seed():
         all_member_ids = [demo_id] + [uid for uid, _, _ in member_records]
         await db.leagues.insert_one({
             "id": league_id,
-            "name": "Lega Serie A Fantacalcio 2025/26",
+            "name": "Lega Campionato Italiano 2025/26",
             "code": DEMO_LEAGUE_CODE,
             "admin_id": demo_id,
             "member_ids": all_member_ids,
