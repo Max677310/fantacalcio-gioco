@@ -1,0 +1,171 @@
+{
+  "app_name": "Fantacalcio Manager",
+  "personality": "6 Glass / Luxe DARK fused with 7 Dark-First Utility (for live sports metrics)",
+  "personality_one_liner": "An elegant, high-stakes command center for Italian Fantasy Football, blending premium cinematic aesthetics with real-time sports utility.",
+  "color": {
+    "surface": "#0D0F12",
+    "onSurface": "#F2F4F7",
+    "surfaceSecondary": "#1A1D24",
+    "onSurfaceSecondary": "#9CA3AF",
+    "surfaceTertiary": "#2A2E39",
+    "onSurfaceTertiary": "#D1D5DB",
+    "surfaceInverse": "#F2F4F7",
+    "onSurfaceInverse": "#0D0F12",
+    "brand": "#0A5C36",
+    "brandPrimary": "#10B981",
+    "onBrandPrimary": "#000000",
+    "brandSecondary": "#D4AF37",
+    "onBrandSecondary": "#000000",
+    "brandTertiary": "#064E3B",
+    "onBrandTertiary": "#A7F3D0",
+    "success": "#10B981",
+    "onSuccess": "#000000",
+    "warning": "#F59E0B",
+    "onWarning": "#000000",
+    "error": "#EF4444",
+    "onError": "#FFFFFF",
+    "info": "#3B82F6",
+    "onInfo": "#FFFFFF",
+    "border": "#2A2E39",
+    "borderStrong": "#4B5563",
+    "divider": "#1F2937"
+  },
+  "typography": {
+    "displayFontFamily": "Fraunces",
+    "textFontFamily": "Satoshi",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Generous vertical breathing room for luxury feel, but tight clustering for live data rows (utility). Keep thumb zones clear for auction controls.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 6,
+    "md": 12,
+    "lg": 20,
+    "pill": 999
+  },
+  "shadow_tier": "1",
+  "navigation": "bottom_tabs",
+  "icon_set": "Ionicons",
+  "glassmorphism": {
+    "enabled": "true",
+    "do's": [
+      "Use heavily on the Live Auction active player card over the stadium background.",
+      "Apply to sticky headers and the bottom tab bar.",
+      "Ensure underlying tint opacity is high (≥75% of surface) to maintain text readability."
+    ],
+    "dont's": [
+      "Don't apply glass to dense data tables or standings lists.",
+      "Don't use glass without a solid tint fallback."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-glass-effect",
+      "android": "expo-blur",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Login",
+      "purpose": "A cinematic entry point introducing the high-stakes, premium feel.",
+      "states": {
+        "loading": "Subtle pulsing brand logo on dark surface.",
+        "empty": "N/A",
+        "error": "Glassmorphism toast with red accent."
+      },
+      "layout": "Full-bleed stadium night photo background. A heavy vertical gradient scrim (transparent to surface at bottom 40%). Glassmorphism login card in the lower half containing email/password inputs and a gold primary CTA."
+    },
+    {
+      "name": "League Dashboard",
+      "purpose": "The main hub showing current rank, next matchday countdown, and quick links.",
+      "states": {
+        "loading": "Skeleton text loaders over surfaceSecondary cards.",
+        "empty": "Illustration of an empty pitch with 'Create or join a league' CTA.",
+        "error": "Retry button with 'Failed to load league data' message."
+      },
+      "layout": "Single column. Top hero card features the user's team emblem (or initials if none) and current standings rank highlighted in brandSecondary (Gold). Below: Horizontal scroll of next opponent/matchday countdown, followed by a vertical feed of recent league activity and push notifications."
+    },
+    {
+      "name": "Live Auction (Asta Live)",
+      "purpose": "A real-time, stress-inducing yet elegant command center for bidding on players.",
+      "states": {
+        "loading": "Centered spinner 'Waiting for auctioneer...'",
+        "empty": "Trophy illustration with 'Auction Complete!' message.",
+        "error": "Connection lost alert with automatic reconnect overlay."
+      },
+      "layout": "Split layout. Top 40%: Active Player Profile using player silhouette photo, large display typography (Fraunces) for name, and a massive 'Current Bid' number. Bottom 60%: Scrollable real-time bid log (websockets). Anchored to the bottom safe area: Sticky glassmorphism bidding controls (Bid +1, Custom Bid, Pass)."
+    },
+    {
+      "name": "Team Lineup (Formazione)",
+      "purpose": "Visual management of the user's starting 11.",
+      "states": {
+        "loading": "Pitch background with pulsing skeleton chips.",
+        "empty": "Pitch background with empty plus-slots.",
+        "error": "Error loading lineup."
+      },
+      "layout": "Full-screen football pitch visualization (emerald green background with white line overlays). Players are represented as glassmorphism chips floating on the pitch in a 4-3-3 or chosen formation. Bottom sheet handle visible to swipe up bench players."
+    },
+    {
+      "name": "Custom Regulations & Standings",
+      "purpose": "Admin settings for scoring modifiers and displaying the league table.",
+      "states": {
+        "loading": "List skeleton.",
+        "empty": "No rules set.",
+        "error": "Failed to load standings."
+      },
+      "layout": "Standard single-column data list. Settings use tinted icon containers. Standings use tight row spacing for utility, highlighting 1st place with brandSecondary (Gold) text/icons."
+    }
+  ],
+  "images": {
+    "hero_stadium_night": {
+      "url": "https://images.pexels.com/photos/15867405/pexels-photo-15867405.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Aerial view of an illuminated football stadium at night"
+    },
+    "player_silhouette_placeholder": {
+      "url": "https://images.unsplash.com/photo-1584462746497-276f4aeb9fca?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzMzV8MHwxfHNlYXJjaHwxfHxzb2NjZXIlMjBwbGF5ZXIlMjBzaWxob3VldHRlJTIwcG9ydHJhaXQlMjBkYXJrfGVufDB8fHx8MTc4Nzc0ODY2NHww&ixlib=rb-4.1.0&q=85",
+      "alt": "Dark silhouette of a male figure"
+    },
+    "trophy_empty_state": {
+      "url": "https://images.pexels.com/photos/6532380/pexels-photo-6532380.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Silver trophies on a celebratory background"
+    },
+    "soccer_ball_decorative": {
+      "url": "https://images.pexels.com/photos/16826135/pexels-photo-16826135.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940",
+      "alt": "Soccer ball on dark pitch under floodlights"
+    }
+  },
+  "events": {
+    "onBidSuccess": "success",
+    "onBidFail": "error",
+    "onPlayerMovedInFormation": "selection",
+    "onTabChange": "light"
+  },
+  "instructions_to_main_agent": [
+    "Premium/Luxe Dark Mode First: The app must feel like a premium Italian sports broadcast (e.g. Serie A). Use the selected Fraunces serif for large headers/titles to give it that 'Gazzetta' elegance, but keep the data/metrics highly readable using Satoshi.",
+    "Zero Blue Rule: Ensure no default blue (indigo/navy/royal) is used anywhere. Follow the Emerald (#0A5C36) and Antique Gold (#D4AF37) palette provided.",
+    "Live Auction (Asta Live): The web research indicated this screen needs a high-stakes, fast-paced layout. Build the top half as the 'Active Player' zone (photo + current highest bid). Build a sticky bottom container with 'Bid +1', 'Pass' and a 'Custom Bid' input so thumb reach is instant. Use Mock Websocket/interval logic to simulate incoming bids in a scrolling list in the middle.",
+    "Lineup/Formation (Formazione): Instead of a boring list, build a visual pitch using standard React Native Views with CSS borders for field lines. Place player 'chips' (glassmorphism pills) absolutely positioned based on 4-3-3 structure.",
+    "Text Over Images: ANY time text overlays the stadium or player photos, you MUST implement a linear gradient scrim (top-to-bottom, transparent to surface at 70%+ opacity).",
+    "Build the Login screen and League Dashboard first, then tackle the complex Asta Live screen."
+  ]
+}

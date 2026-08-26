@@ -1,0 +1,33 @@
+{
+  "summary": "Iteration 2 (multi-user invite system): 17/17 backend pytest tests PASS. All key features verified: register with action=create returns token + creates league with unique 6-digit code (admin membership), register with action=join + invite_code=123456 joins demo league, duplicate team_name in same league returns 409, POST /api/leagues/create (auth) works, POST /api/leagues/join works, GET /api/leagues/{id}/members returns team_names+roles, GET /api/leagues/{id}/my-membership works, dashboard exposes my_team_name='Milano Warriors', standings expose team_name field, /api/players returns exactly 213 players (Osimhen absent; Nico Paz, Lautaro Martinez, Rasmus Højlund, Scott McTominay present). Frontend: Sign-in with demo creds -> Dashboard shows 'Milano Warriors' as team title + 'Codice invito 123456' strip; Lega tab shows big 123456 code, ADMIN badge on demo user, working Copia button ('Copiato!' feedback), Membri list with team_names for all seeded managers. Sign-up screen toggles correctly between 'Crea lega' (league_name field) and 'Unisciti con codice' (invite code field). Registering new user with action=join code=123456 successfully creates account, joins demo league, and lands on dashboard showing the new user's own team_name and the demo league code 123456.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "league.tsx member counter", "issue": "Section header shows 'Membri N/8' hardcoded to /8. If more than 8 members join (as happened during automated join tests), counter reads e.g. '10/8'. Consider making the cap dynamic or based on league.max_members.", "testID": "league-screen", "priority": "LOW"}
+    ],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "unknown (dependency)", "issue": "Console warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Persists from iteration 1; likely from a react-native-web dependency. Non-blocking."}
+    ]
+  },
+  "test_report_links": ["/app/backend/tests/test_fantacalcio.py", "/app/test_reports/pytest/pytest_results.xml"],
+  "action_items": [
+    "(Optional) Make member counter dynamic in league.tsx instead of '/8'.",
+    "(Optional) Silence or migrate the 'props.pointerEvents is deprecated' warning."
+  ],
+  "critical_code_review_comments": [
+    "server.py grew to ~950 lines with all handlers + seed in one file. Consider splitting: routes/auth.py, routes/leagues.py, routes/players.py, routes/auction.py, seed.py.",
+    "join_league_with_code case-insensitive team_name check uses $regex with user-supplied input WITHOUT escaping regex metacharacters — e.g. team_name='.*' could match anything. Recommend anchoring with re.escape(team_name) or use $eq with $regex '^' + escaped + '$'.",
+    "register with action='join' or 'create' still creates the user first; if league join then fails (e.g. duplicate team_name -> 409), the user account is persisted but has no league. Consider either transactional rollback or checking league validity before user insert.",
+    "auction/bid does not validate membership across leagues rigorously (already noted in iteration 1) — a member of league A cannot bid in league B due to membership check, but there is no test asserting 403.",
+    "Frontend uses process.env.EXPO_PUBLIC_BACKEND_URL correctly for API base URL."
+  ],
+  "updated_files": ["/app/backend/tests/test_fantacalcio.py"],
+  "success_rate": {"backend": "100% (17/17)", "frontend": "100% (login flow, dashboard my_team_name, invite strip, league tab code+ADMIN+Copia+members list, sign-up mode toggle, sign-up join creating account and joining demo league — all verified)"},
+  "seed_data_creation": "Test users are ephemeral (email prefix 'test_' + uuid; UI test used 'uitest_<epoch>@fanta.it'). They persist in DB but do not interfere with demo flows. Demo league now has extra memberships from tests (see UI bug about counter).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend base URL: process.env.EXPO_PUBLIC_BACKEND_URL from /app/frontend/.env. Auth: demo@fanta.it/demo1234 (admin of demo league, team 'Milano Warriors', code '123456'). Key testIDs: sign-up-screen, mode-create, mode-join, sign-up-name-input, sign-up-email-input, sign-up-password-input, sign-up-team-input, sign-up-league-name-input, sign-up-code-input, sign-up-submit-button, sign-up-error, onboarding-screen (shown if authenticated user has no league), dashboard-screen, qa-league, dashboard-invite-strip, league-screen, invite-code-card, copy-code-btn, share-code-btn, member-row-<i>. Backend endpoints tested: /api/auth/{register,login,me}, /api/leagues/{create,join,mine,<id>,<id>/members,<id>/my-membership}, /api/players, /api/dashboard/<id>, /api/standings/<id>, /api/auction/<id>/{state,bid,next}, /api/regulations/<id>, /api/activity/<id>.",
+  "rca_of_issue": "N/A — all target features working. Only a low-priority hardcoded '/8' counter and one minor security note (unescaped regex in join_league_with_code duplicate-team check) surfaced during code review."
+}
