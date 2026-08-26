@@ -19,6 +19,10 @@ type Summary = {
   my_team_name: string;
   rank: number; points: number; next_matchday: number; next_kickoff: string; members: number;
 };
+type Fixture = {
+  matchday: number; home_user_id: string | null; away_user_id: string | null;
+  home_team: string | null; away_team: string | null; is_bye: boolean; bye_team: string | null;
+};
 
 const kindIcon = (k: string): { name: any; color: string } => {
   switch (k) {
@@ -54,22 +58,32 @@ export default function Dashboard() {
   const { league } = useLeague();
   const [summary, setSummary] = useState<Summary | null>(null);
   const [activity, setActivity] = useState<Activity[]>([]);
+  const [myFixture, setMyFixture] = useState<Fixture | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    if (!league) return;
+    if (!league || !user) return;
     try {
-      const [s, a] = await Promise.all([api.dashboard(league.id), api.activity(league.id)]);
+      const [s, a, fx] = await Promise.all([
+        api.dashboard(league.id),
+        api.activity(league.id),
+        api.fixtures(league.id, 1).catch(() => []),
+      ]);
       setSummary(s);
       setActivity(a);
+      const mine = fx.find((f: Fixture) =>
+        (f.is_bye && f.bye_team === s.my_team_name) ||
+        f.home_user_id === user.id || f.away_user_id === user.id
+      );
+      setMyFixture(mine || null);
     } catch (e) {
       console.log('dashboard load err', e);
     } finally {
       setLoading(false);
       setRefreshing(false);
     }
-  }, [league]);
+  }, [league, user]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -145,10 +159,10 @@ export default function Dashboard() {
         <View style={styles.quickRow}>
           <QuickAction icon="flame" label="Asta Live" tint={theme.colors.error} badge="LIVE"
             onPress={() => router.push('/(tabs)/auction')} testID="qa-auction" />
-          <QuickAction icon="people" label="Lega & Invito" tint={theme.colors.brandSecondary}
-            onPress={() => router.push('/(tabs)/league')} testID="qa-league" />
-          <QuickAction icon="settings-outline" label="Regolamento" tint={theme.colors.onSurfaceSecondary}
-            onPress={() => router.push('/settings')} testID="qa-settings" />
+          <QuickAction icon="radio" label="Live Match" tint={theme.colors.success} badge="LIVE"
+            onPress={() => router.push('/live')} testID="qa-live" />
+          <QuickAction icon="swap-horizontal" label="Mercato" tint={theme.colors.brandSecondary}
+            onPress={() => router.push('/mercato')} testID="qa-mercato" />
         </View>
 
         {/* Invite Code Strip */}
@@ -163,6 +177,34 @@ export default function Dashboard() {
           <Text style={styles.inviteCode}>{summary.league.code}</Text>
           <Ionicons name="chevron-forward" size={18} color={theme.colors.onSurfaceSecondary} />
         </Pressable>
+
+        {/* Fixture card */}
+        {myFixture && (
+          <View style={styles.fixtureCard} testID="dashboard-fixture">
+            <View style={styles.fixtureHead}>
+              <Text style={styles.fixtureLbl}>PROSSIMO SCONTRO · {myFixture.matchday}ª GIORNATA</Text>
+            </View>
+            {myFixture.is_bye ? (
+              <View style={styles.byeBox}>
+                <Ionicons name="pause-circle" size={22} color={theme.colors.warning} />
+                <Text style={styles.byeText}>Turno di riposo</Text>
+                <Text style={styles.byeSub}>La tua squadra non gioca questa giornata</Text>
+              </View>
+            ) : (
+              <View style={styles.matchRow}>
+                <View style={styles.matchSide}>
+                  <Text style={styles.matchTeam} numberOfLines={1}>{myFixture.home_team}</Text>
+                  <Text style={styles.matchTag}>CASA</Text>
+                </View>
+                <Text style={styles.matchVs}>vs</Text>
+                <View style={styles.matchSide}>
+                  <Text style={styles.matchTeam} numberOfLines={1}>{myFixture.away_team}</Text>
+                  <Text style={styles.matchTag}>OSPITE</Text>
+                </View>
+              </View>
+            )}
+          </View>
+        )}
 
         {/* Section: Activity */}
         <View style={styles.sectionHead}>
@@ -301,6 +343,24 @@ const styles = StyleSheet.create({
     color: theme.colors.brandSecondary,
     fontSize: 18, fontWeight: '800', letterSpacing: 2,
   },
+
+  fixtureCard: {
+    marginHorizontal: theme.spacing.lg, marginTop: theme.spacing.md,
+    padding: theme.spacing.md,
+    backgroundColor: theme.colors.surfaceSecondary,
+    borderRadius: theme.radius.md,
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  fixtureHead: { marginBottom: theme.spacing.md },
+  fixtureLbl: { color: theme.colors.brandSecondary, fontSize: 10, fontWeight: '800', letterSpacing: 1.2 },
+  matchRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  matchSide: { flex: 1, alignItems: 'center', gap: 4 },
+  matchTeam: { color: theme.colors.onSurface, fontSize: 15, fontWeight: '800' },
+  matchTag: { color: theme.colors.onSurfaceSecondary, fontSize: 9, fontWeight: '700', letterSpacing: 1 },
+  matchVs: { color: theme.colors.brandSecondary, fontSize: 14, fontWeight: '800' },
+  byeBox: { alignItems: 'center', gap: 6, paddingVertical: 8 },
+  byeText: { color: theme.colors.warning, fontSize: 15, fontWeight: '800' },
+  byeSub: { color: theme.colors.onSurfaceSecondary, fontSize: 11 },
 
   sectionHead: {
     flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',

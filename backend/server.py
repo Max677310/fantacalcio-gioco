@@ -31,7 +31,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 7  # 7 days
 
-SEED_VERSION = 4  # bump to force re-seed of players from official listone
+SEED_VERSION = 6  # bump to force re-seed with wallets/rosters/fixtures/live_events
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -87,6 +87,47 @@ class League(BaseModel):
     code: str
     admin_id: str
     member_ids: List[str] = []
+    budget_per_user: int = 500
+    transfer_window_open: bool = False
+    created_at: datetime
+
+class Wallet(BaseModel):
+    league_id: str
+    user_id: str
+    budget: int
+    spent: int
+    remaining: int
+
+class RosterEntry(BaseModel):
+    player_id: str
+    price_paid: int
+
+class Roster(BaseModel):
+    league_id: str
+    user_id: str
+    team_name: str
+    entries: List[RosterEntry] = []
+
+class Fixture(BaseModel):
+    league_id: str
+    matchday: int
+    home_user_id: Optional[str]
+    away_user_id: Optional[str]
+    home_team: Optional[str]
+    away_team: Optional[str]
+    is_bye: bool = False
+    bye_user_id: Optional[str] = None
+    bye_team: Optional[str] = None
+
+class LiveEvent(BaseModel):
+    id: str
+    matchday: int
+    player_id: Optional[str]
+    player_name: str
+    team: str
+    kind: Literal["goal", "assist", "yellow", "red", "own_goal", "penalty_saved", "penalty_missed", "sub", "kick_off", "half_time", "full_time"]
+    minute: int
+    description: str
     created_at: datetime
 
 class Membership(BaseModel):
@@ -205,6 +246,99 @@ async def require_admin(league_id: str, user: dict) -> dict:
         raise HTTPException(403, "Solo l'amministratore della lega può eseguire questa operazione")
     return m
 
+def generate_round_robin(user_ids: List[str]) -> List[List[tuple]]:
+    """Return a list of matchdays, each a list of (home, away) tuples.
+    If N is odd, a None placeholder is added; the team paired with None gets a bye.
+    Uses the standard circle method (Berger table).
+    """
+    teams = list(user_ids)
+    if len(teams) < 2:
+        return []
+    if len(teams) % 2 == 1:
+        teams.append(None)  # bye placeholder
+    n = len(teams)
+    rounds = []
+    fixed = teams[0]
+    rotating = teams[1:]
+    for r in range(n - 1):
+        pairs = []
+        # first pair: fixed vs rotating[-1]
+        pairs.append((fixed, rotating[-1]))
+        for i in range(len(rotating) - 1):
+            pairs.append((rotating[i], rotating[-2 - i] if -2 - i >= -len(rotating) else rotating[i + 1]))
+            if len(pairs) >= n // 2:
+                break
+        # alternate home/away by round parity
+        if r % 2 == 1:
+            pairs = [(b, a) for (a, b) in pairs]
+        rounds.append(pairs)
+        rotating = [rotating[-1]] + rotating[:-1]
+    return rounds
+
+
+async def build_fixtures(league_id: str) -> None:
+    """Regenerate the full round-robin fixtures for a league."""
+    memberships = await db.memberships.find(
+        {"league_id": league_id}, {"_id": 0}
+    ).sort("joined_at", 1).to_list(100)
+    if len(memberships) < 2:
+        await db.fixtures.delete_many({"league_id": league_id})
+        return
+    uid_to_team = {m["user_id"]: m["team_name"] for m in memberships}
+    user_ids = [m["user_id"] for m in memberships]
+    rounds = generate_round_robin(user_ids)
+
+    await db.fixtures.delete_many({"league_id": league_id})
+    docs = []
+    for idx, pairs in enumerate(rounds):
+        matchday = idx + 1
+        for home, away in pairs:
+            if home is None or away is None:
+                bye_uid = home or away
+                docs.append({
+                    "league_id": league_id, "matchday": matchday,
+                    "home_user_id": None, "away_user_id": None,
+                    "home_team": None, "away_team": None,
+                    "is_bye": True,
+                    "bye_user_id": bye_uid,
+                    "bye_team": uid_to_team.get(bye_uid),
+                })
+            else:
+                docs.append({
+                    "league_id": league_id, "matchday": matchday,
+                    "home_user_id": home, "away_user_id": away,
+                    "home_team": uid_to_team.get(home),
+                    "away_team": uid_to_team.get(away),
+                    "is_bye": False,
+                })
+    if docs:
+        await db.fixtures.insert_many(docs)
+
+
+async def init_wallet(league_id: str, user_id: str, budget: int) -> None:
+    existing = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": user_id}
+    )
+    if existing:
+        return
+    await db.wallets.insert_one({
+        "league_id": league_id, "user_id": user_id,
+        "budget": budget, "spent": 0, "remaining": budget,
+    })
+
+
+async def init_roster(league_id: str, user_id: str, team_name: str) -> None:
+    existing = await db.rosters.find_one(
+        {"league_id": league_id, "user_id": user_id}
+    )
+    if existing:
+        return
+    await db.rosters.insert_one({
+        "league_id": league_id, "user_id": user_id,
+        "team_name": team_name, "entries": [],
+    })
+
+
 async def create_league_for_user(user: dict, league_name: str, team_name: str) -> dict:
     league_id = str(uuid.uuid4())
     code = await gen_invite_code()
@@ -214,6 +348,8 @@ async def create_league_for_user(user: dict, league_name: str, team_name: str) -
         "code": code,
         "admin_id": user["id"],
         "member_ids": [user["id"]],
+        "budget_per_user": 500,
+        "transfer_window_open": False,
         "created_at": now_iso(),
         "is_demo": False,
     }
@@ -226,9 +362,12 @@ async def create_league_for_user(user: dict, league_name: str, team_name: str) -
         "role": "admin",
         "joined_at": now_iso(),
     })
-    # seed default regulations
+    # seed default regulations, wallet, roster, fixtures
     reg = Regulations(league_id=league_id).model_dump()
     await db.regulations.insert_one(dict(reg))
+    await init_wallet(league_id, user["id"], 500)
+    await init_roster(league_id, user["id"], team_name.strip())
+    await build_fixtures(league_id)
     return league_doc
 
 async def join_league_with_code(user: dict, code: str, team_name: str) -> dict:
@@ -261,6 +400,11 @@ async def join_league_with_code(user: dict, code: str, team_name: str) -> dict:
         {"id": league["id"]},
         {"$addToSet": {"member_ids": user["id"]}}
     )
+    # Initialize wallet & roster, then regenerate fixtures for new member set
+    budget = league.get("budget_per_user", 500)
+    await init_wallet(league["id"], user["id"], budget)
+    await init_roster(league["id"], user["id"], team_name.strip())
+    await build_fixtures(league["id"])
     return league
 
 # ------------------------------------------------------------
@@ -429,6 +573,13 @@ async def place_bid(league_id: str, body: BidRequest, current=Depends(get_curren
         raise HTTPException(400, "Asta non attiva")
     if body.amount <= st.get("current_bid", 0):
         raise HTTPException(400, f"Il rilancio deve essere maggiore di {st.get('current_bid', 0)}")
+    # Wallet check — user must have enough credits to cover their bid
+    wallet = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    remaining = (wallet or {}).get("remaining", 500)
+    if body.amount > remaining:
+        raise HTTPException(400, f"Fantamilioni insufficienti: ne hai {remaining}")
     bidder_label = membership.get("team_name") or current["name"]
     bid = {
         "id": str(uuid.uuid4()),
@@ -476,6 +627,268 @@ async def next_player(league_id: str, body: NextPlayerRequest, current=Depends(g
         upsert=True,
     )
     return AuctionState(**new_state)
+
+
+@api.post("/auction/{league_id}/assign", response_model=AuctionState)
+async def assign_current_bid(league_id: str, current=Depends(get_current_user)):
+    """Admin assigns the current active player to the highest bidder, deducts wallet and adds to roster."""
+    await require_admin(league_id, current)
+    st = await db.auction_state.find_one({"league_id": league_id}, {"_id": 0})
+    if not st or not st.get("active_player_id"):
+        raise HTTPException(400, "Nessun giocatore in asta")
+    if not st.get("current_bidder_id"):
+        raise HTTPException(400, "Nessuna offerta valida da assegnare")
+    winner_id = st["current_bidder_id"]
+    amount = int(st["current_bid"])
+    player_id = st["active_player_id"]
+
+    # Prevent duplicate assignment
+    existing_roster = await db.rosters.find_one({
+        "league_id": league_id, "user_id": winner_id
+    }, {"_id": 0})
+    if existing_roster:
+        already = any(e["player_id"] == player_id for e in existing_roster.get("entries", []))
+        if already:
+            raise HTTPException(400, "Giocatore già in rosa del vincitore")
+
+    # Deduct wallet
+    wallet = await db.wallets.find_one({"league_id": league_id, "user_id": winner_id})
+    if not wallet:
+        raise HTTPException(400, "Wallet del vincitore mancante")
+    if amount > wallet["remaining"]:
+        raise HTTPException(400, "Fantamilioni insufficienti del vincitore")
+    await db.wallets.update_one(
+        {"league_id": league_id, "user_id": winner_id},
+        {"$inc": {"spent": amount, "remaining": -amount}},
+    )
+    # Add to roster
+    await db.rosters.update_one(
+        {"league_id": league_id, "user_id": winner_id},
+        {"$push": {"entries": {"player_id": player_id, "price_paid": amount}}},
+        upsert=True,
+    )
+    # Mark auction as sold + reset
+    new_state = {
+        "league_id": league_id,
+        "active_player_id": None,
+        "current_bid": 1,
+        "current_bidder_id": None,
+        "current_bidder_name": None,
+        "status": "sold",
+    }
+    await db.auction_state.update_one({"league_id": league_id}, {"$set": new_state})
+    return AuctionState(**new_state)
+
+
+# ------------------------------------------------------------
+# Wallets, Rosters & Fixtures
+# ------------------------------------------------------------
+@api.get("/leagues/{league_id}/wallet", response_model=Wallet)
+async def my_wallet(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    w = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    if not w:
+        raise HTTPException(404, "Wallet non trovato")
+    return Wallet(**w)
+
+
+@api.get("/leagues/{league_id}/wallets", response_model=List[Wallet])
+async def all_wallets(league_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    cursor = db.wallets.find({"league_id": league_id}, {"_id": 0})
+    return [Wallet(**w) for w in await cursor.to_list(100)]
+
+
+@api.get("/leagues/{league_id}/roster/{user_id}", response_model=Roster)
+async def user_roster(league_id: str, user_id: str, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    r = await db.rosters.find_one({"league_id": league_id, "user_id": user_id}, {"_id": 0})
+    if not r:
+        raise HTTPException(404, "Rosa non trovata")
+    return Roster(**r)
+
+
+@api.get("/leagues/{league_id}/fixtures", response_model=List[Fixture])
+async def league_fixtures(
+    league_id: str,
+    matchday: Optional[int] = None,
+    current=Depends(get_current_user),
+):
+    await require_membership(league_id, current)
+    query = {"league_id": league_id}
+    if matchday is not None:
+        query["matchday"] = matchday
+    cursor = db.fixtures.find(query, {"_id": 0}).sort([("matchday", 1)])
+    return [Fixture(**f) for f in await cursor.to_list(1000)]
+
+
+@api.post("/leagues/{league_id}/fixtures/regenerate", response_model=List[Fixture])
+async def regenerate_fixtures(league_id: str, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
+    await build_fixtures(league_id)
+    cursor = db.fixtures.find({"league_id": league_id}, {"_id": 0}).sort([("matchday", 1)])
+    return [Fixture(**f) for f in await cursor.to_list(1000)]
+
+
+# ------------------------------------------------------------
+# Mercato di Riparazione (Transfer Window)
+# ------------------------------------------------------------
+class MercatoState(BaseModel):
+    league_id: str
+    transfer_window_open: bool
+
+
+@api.post("/leagues/{league_id}/mercato/open", response_model=MercatoState)
+async def mercato_open(league_id: str, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
+    await db.leagues.update_one({"id": league_id}, {"$set": {"transfer_window_open": True}})
+    return MercatoState(league_id=league_id, transfer_window_open=True)
+
+
+@api.post("/leagues/{league_id}/mercato/close", response_model=MercatoState)
+async def mercato_close(league_id: str, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
+    await db.leagues.update_one({"id": league_id}, {"$set": {"transfer_window_open": False}})
+    return MercatoState(league_id=league_id, transfer_window_open=False)
+
+
+class ReleaseRequest(BaseModel):
+    player_id: str
+
+
+@api.post("/leagues/{league_id}/mercato/release", response_model=Wallet)
+async def release_player(league_id: str, body: ReleaseRequest, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not (league or {}).get("transfer_window_open"):
+        raise HTTPException(400, "Il mercato di riparazione non è aperto")
+    roster = await db.rosters.find_one(
+        {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    if not roster:
+        raise HTTPException(404, "Rosa non trovata")
+    entry = next((e for e in roster.get("entries", []) if e["player_id"] == body.player_id), None)
+    if not entry:
+        raise HTTPException(404, "Giocatore non presente nella tua rosa")
+    refund = max(1, int(entry["price_paid"] * 0.5))
+    # Remove from roster
+    await db.rosters.update_one(
+        {"league_id": league_id, "user_id": current["id"]},
+        {"$pull": {"entries": {"player_id": body.player_id}}},
+    )
+    # Refund wallet
+    await db.wallets.update_one(
+        {"league_id": league_id, "user_id": current["id"]},
+        {"$inc": {"spent": -refund, "remaining": refund}},
+    )
+    w = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    return Wallet(**w)
+
+
+class BuyRequest(BaseModel):
+    player_id: str
+
+
+@api.post("/leagues/{league_id}/mercato/buy", response_model=Wallet)
+async def buy_free_agent(league_id: str, body: BuyRequest, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not (league or {}).get("transfer_window_open"):
+        raise HTTPException(400, "Il mercato di riparazione non è aperto")
+    # Ensure player is a free agent (not owned in this league)
+    owned = await db.rosters.find_one(
+        {"league_id": league_id, "entries.player_id": body.player_id}, {"_id": 0}
+    )
+    if owned:
+        raise HTTPException(400, "Giocatore già di proprietà di un altro manager")
+    player = await db.players.find_one({"id": body.player_id}, {"_id": 0})
+    if not player:
+        raise HTTPException(404, "Giocatore non trovato")
+    price = int(player["price"])
+    wallet = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": current["id"]}
+    )
+    if not wallet or wallet["remaining"] < price:
+        raise HTTPException(400, f"Fantamilioni insufficienti: servono {price}")
+    await db.wallets.update_one(
+        {"league_id": league_id, "user_id": current["id"]},
+        {"$inc": {"spent": price, "remaining": -price}},
+    )
+    await db.rosters.update_one(
+        {"league_id": league_id, "user_id": current["id"]},
+        {"$push": {"entries": {"player_id": body.player_id, "price_paid": price}}},
+        upsert=True,
+    )
+    w = await db.wallets.find_one(
+        {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+    )
+    return Wallet(**w)
+
+
+@api.get("/leagues/{league_id}/free-agents", response_model=List[Player])
+async def free_agents(
+    league_id: str,
+    role: Optional[Role] = None,
+    q: Optional[str] = None,
+    current=Depends(get_current_user),
+):
+    await require_membership(league_id, current)
+    # Collect owned player ids across all rosters in this league
+    cursor = db.rosters.find({"league_id": league_id}, {"_id": 0, "entries": 1})
+    owned_ids = set()
+    async for r in cursor:
+        for e in r.get("entries", []):
+            owned_ids.add(e["player_id"])
+    query = {"id": {"$nin": list(owned_ids)}}
+    if role:
+        query["role"] = role
+    if q:
+        query["name"] = {"$regex": re.escape(q[:64]), "$options": "i"}
+    cur2 = db.players.find(query, {"_id": 0}).sort("price", -1).limit(80)
+    return [Player(**p) for p in await cur2.to_list(80)]
+
+
+# ------------------------------------------------------------
+# Live Matchday Feed
+# ------------------------------------------------------------
+@api.get("/live-events", response_model=List[LiveEvent])
+async def get_live_events(matchday: Optional[int] = None, current=Depends(get_current_user)):
+    query = {}
+    if matchday is not None:
+        query["matchday"] = matchday
+    cursor = db.live_events.find(query, {"_id": 0}).sort("created_at", -1).limit(60)
+    return [LiveEvent(**e) for e in await cursor.to_list(60)]
+
+
+class LiveEventCreate(BaseModel):
+    matchday: int
+    player_name: str
+    team: str
+    kind: str
+    minute: int
+    description: str
+    player_id: Optional[str] = None
+
+
+@api.post("/live-events", response_model=LiveEvent)
+async def create_live_event(body: LiveEventCreate, current=Depends(get_current_user)):
+    ev = {
+        "id": str(uuid.uuid4()),
+        "matchday": body.matchday,
+        "player_id": body.player_id,
+        "player_name": body.player_name,
+        "team": body.team,
+        "kind": body.kind,
+        "minute": body.minute,
+        "description": body.description,
+        "created_at": now_iso(),
+    }
+    await db.live_events.insert_one(dict(ev))
+    return LiveEvent(**ev)
 
 # ------------------------------------------------------------
 # Regulations
@@ -638,6 +1051,10 @@ async def seed():
         await db.activity.drop()
         await db.auction_state.drop()
         await db.bids.drop()
+        await db.wallets.drop()
+        await db.rosters.drop()
+        await db.fixtures.drop()
+        await db.live_events.drop()
         await ensure_indexes()
 
     # Players — official listone loaded from JSON file
@@ -698,6 +1115,8 @@ async def seed():
             "code": DEMO_LEAGUE_CODE,
             "admin_id": demo_id,
             "member_ids": all_member_ids,
+            "budget_per_user": 500,
+            "transfer_window_open": False,
             "created_at": now_iso(),
             "is_demo": True,
         })
@@ -755,6 +1174,75 @@ async def seed():
                 "created_at": (now - timedelta(minutes=i * 17)).isoformat(),
             })
         await db.activity.insert_many(act_docs)
+
+        # === Wallets, Rosters, Fixtures, Live events (v5) ===
+        random.seed(101)
+        all_players = await db.players.find({}, {"_id": 0}).to_list(2000)
+        by_role = {"P": [], "D": [], "C": [], "A": []}
+        for p in all_players:
+            by_role.setdefault(p["role"], []).append(p)
+        for role in by_role:
+            random.shuffle(by_role[role])
+
+        # Assign small random rosters + wallets to each demo manager
+        managers = [(demo_id, demo_name, demo_team)] + member_records
+        pick_counts = {"P": 3, "D": 8, "C": 8, "A": 6}
+        for uid, uname, tname in managers:
+            entries = []
+            spent = 0
+            for role, count in pick_counts.items():
+                for _ in range(count):
+                    if not by_role[role]:
+                        continue
+                    p = by_role[role].pop()
+                    price = max(1, int(p["price"]))
+                    if spent + price > 480:  # keep some budget free
+                        break
+                    entries.append({"player_id": p["id"], "price_paid": price})
+                    spent += price
+            await db.rosters.insert_one({
+                "league_id": league_id, "user_id": uid,
+                "team_name": tname, "entries": entries,
+            })
+            await db.wallets.insert_one({
+                "league_id": league_id, "user_id": uid,
+                "budget": 500, "spent": spent, "remaining": 500 - spent,
+            })
+
+        # Build fixtures with round-robin
+        await build_fixtures(league_id)
+
+        # Seed live events for current matchday (6)
+        current_md = 6
+        live_events = [
+            ("Lautaro Martinez", "Inter", "goal", 12, "Gol! Inter-Milan 1-0", "p0003"),
+            ("Marcus Thuram", "Inter", "assist", 12, "Assist per Lautaro Martinez", None),
+            ("Rafael Leao", "Milan", "yellow", 24, "Ammonizione per fallo tattico", None),
+            ("Pulisic", "Milan", "goal", 38, "Pareggio Milan! Inter-Milan 1-1", None),
+            ("Nico Paz", "Como", "goal", 41, "Como avanti 1-0 sul Napoli", None),
+            ("De Bruyne", "Napoli", "assist", 55, "Assist di De Bruyne per Højlund", None),
+            ("Hojlund", "Napoli", "goal", 55, "Napoli pareggia 1-1", None),
+            ("Yildiz", "Juventus", "goal", 61, "Juve avanti sulla Lazio", None),
+            ("Kean", "Fiorentina", "penalty_missed", 68, "Kean sbaglia il rigore!", None),
+            ("Maignan", "Milan", "penalty_saved", 74, "Maignan para il penalty!", None),
+            ("Dybala", "Roma", "red", 82, "Rosso diretto a Dybala", None),
+            ("Orsolini", "Bologna", "goal", 88, "Gol Orsolini nel finale", None),
+        ]
+        live_docs = []
+        base = datetime.now(timezone.utc)
+        for i, (name, team, kind, minute, desc, pid) in enumerate(live_events):
+            live_docs.append({
+                "id": str(uuid.uuid4()),
+                "matchday": current_md,
+                "player_id": pid,
+                "player_name": name,
+                "team": team,
+                "kind": kind,
+                "minute": minute,
+                "description": desc,
+                "created_at": (base - timedelta(minutes=(len(live_events) - i) * 3)).isoformat(),
+            })
+        await db.live_events.insert_many(live_docs)
 
     await db.meta.update_one(
         {"_id": "seed"}, {"$set": {"version": SEED_VERSION}}, upsert=True

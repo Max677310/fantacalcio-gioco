@@ -2,7 +2,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback } fr
 import { api } from './api';
 import { useAuth } from './auth';
 
-type League = { id: string; name: string; admin_id: string; member_ids: string[] } | null;
+type League = { id: string; name: string; admin_id: string; member_ids: string[]; code: string; transfer_window_open?: boolean } | null;
 
 interface LeagueCtx {
   league: League;

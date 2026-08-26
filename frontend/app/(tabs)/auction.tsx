@@ -38,6 +38,7 @@ export default function Auction() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [roleFilter, setRoleFilter] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [wallet, setWallet] = useState<any>(null);
   const pollRef = useRef<any>(null);
 
   const load = useCallback(async () => {
@@ -45,12 +46,14 @@ export default function Auction() {
     try {
       const s = await api.auctionState(league.id);
       setState(s);
-      const [p, b] = await Promise.all([
+      const [p, b, w] = await Promise.all([
         s.active_player_id ? api.player(s.active_player_id) : Promise.resolve(null),
         api.auctionBids(league.id),
+        api.wallet(league.id).catch(() => null),
       ]);
       setPlayer(p);
       setBids(b);
+      setWallet(w);
     } catch (e) { console.log('auction load err', e); }
     finally { setLoading(false); }
   }, [league]);
@@ -147,6 +150,15 @@ export default function Auction() {
 
         {/* Middle - Bid log */}
         <View style={styles.logSection}>
+          {wallet && (
+            <View style={styles.walletBar} testID="auction-wallet">
+              <Ionicons name="wallet" size={14} color={theme.colors.brandSecondary} />
+              <Text style={styles.walletLbl}>I tuoi Fantamilioni</Text>
+              <View style={{ flex: 1 }} />
+              <Text style={styles.walletVal}>{wallet.remaining}</Text>
+              <Text style={styles.walletTot}> / {wallet.budget}</Text>
+            </View>
+          )}
           <Text style={styles.logHead}>Log offerte</Text>
           <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingBottom: 20 }}>
             {bids.map((b, i) => {
@@ -322,6 +334,15 @@ const styles = StyleSheet.create({
   bidderName: { color: theme.colors.onSurface, fontSize: 15, fontWeight: '700' },
 
   logSection: { flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.md },
+  walletBar: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: 12, paddingVertical: 10, marginBottom: 12,
+    backgroundColor: 'rgba(212,175,55,0.10)', borderRadius: theme.radius.md,
+    borderWidth: 1, borderColor: 'rgba(212,175,55,0.3)',
+  },
+  walletLbl: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '700', letterSpacing: 0.5, textTransform: 'uppercase' },
+  walletVal: { color: theme.colors.brandSecondary, fontSize: 18, fontWeight: '800' },
+  walletTot: { color: theme.colors.onSurfaceSecondary, fontSize: 12, fontWeight: '600' },
   logHead: { color: theme.colors.onSurface, fontSize: 15, fontWeight: '700', marginBottom: theme.spacing.sm },
   bidRow: {
     flexDirection: 'row', alignItems: 'center', gap: 12,

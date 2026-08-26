@@ -46,6 +46,31 @@ export const api = {
     request<any>('/leagues/join', { method: 'POST', body: JSON.stringify({ code, team_name }) }),
   leagueMembers: (leagueId: string) => request<any[]>(`/leagues/${leagueId}/members`),
   myMembership: (leagueId: string) => request<any>(`/leagues/${leagueId}/my-membership`),
+  wallet: (leagueId: string) => request<any>(`/leagues/${leagueId}/wallet`),
+  wallets: (leagueId: string) => request<any[]>(`/leagues/${leagueId}/wallets`),
+  roster: (leagueId: string, userId: string) => request<any>(`/leagues/${leagueId}/roster/${userId}`),
+  fixtures: (leagueId: string, matchday?: number) => {
+    const qs = matchday !== undefined ? `?matchday=${matchday}` : '';
+    return request<any[]>(`/leagues/${leagueId}/fixtures${qs}`);
+  },
+  mercatoOpen: (leagueId: string) =>
+    request<any>(`/leagues/${leagueId}/mercato/open`, { method: 'POST' }),
+  mercatoClose: (leagueId: string) =>
+    request<any>(`/leagues/${leagueId}/mercato/close`, { method: 'POST' }),
+  releasePlayer: (leagueId: string, playerId: string) =>
+    request<any>(`/leagues/${leagueId}/mercato/release`, { method: 'POST', body: JSON.stringify({ player_id: playerId }) }),
+  buyFreeAgent: (leagueId: string, playerId: string) =>
+    request<any>(`/leagues/${leagueId}/mercato/buy`, { method: 'POST', body: JSON.stringify({ player_id: playerId }) }),
+  freeAgents: (leagueId: string, role?: string) => {
+    const qs = role ? `?role=${role}` : '';
+    return request<any[]>(`/leagues/${leagueId}/free-agents${qs}`);
+  },
+  liveEvents: (matchday?: number) => {
+    const qs = matchday !== undefined ? `?matchday=${matchday}` : '';
+    return request<any[]>(`/live-events${qs}`);
+  },
+  assignBid: (leagueId: string) =>
+    request<any>(`/auction/${leagueId}/assign`, { method: 'POST' }),
   dashboard: (leagueId: string) => request<any>(`/dashboard/${leagueId}`),
   activity: (leagueId: string) => request<any[]>(`/activity/${leagueId}`),
   standings: (leagueId: string) => request<any[]>(`/standings/${leagueId}`),
