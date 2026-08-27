@@ -4,6 +4,7 @@ import {
   ActivityIndicator, Share, Platform, Modal, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useRouter } from 'expo-router';
 import * as Clipboard from 'expo-clipboard';
 import { Ionicons } from '@expo/vector-icons';
 import { api } from '@/src/lib/api';
@@ -14,6 +15,7 @@ import { theme } from '@/src/lib/theme';
 type Member = { user_id: string; user_name: string; team_name: string; role: string; joined_at: string };
 
 export default function LeagueTab() {
+  const router = useRouter();
   const { league, refresh } = useLeague();
   const { user } = useAuth();
   const [members, setMembers] = useState<Member[]>([]);
@@ -164,6 +166,25 @@ export default function LeagueTab() {
             )}
           </View>
         </View>
+
+        {isAdmin && (
+          <Pressable
+            testID="open-matchday-mgmt"
+            onPress={() => router.push('/matchday')}
+            style={({ pressed }) => [styles.settingsCard, styles.mgmtCard, pressed && { opacity: 0.85 }]}
+          >
+            <View style={styles.settingsRow}>
+              <View style={[styles.settingsIcon, { backgroundColor: 'rgba(46,204,113,0.12)', borderColor: 'rgba(46,204,113,0.35)' }]}>
+                <Ionicons name="calculator" size={18} color={theme.colors.success} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.settingsLabel}>Gestione giornata</Text>
+                <Text style={styles.settingsSub}>Carica voti, calcola risultati, aggiorna classifica</Text>
+              </View>
+              <Ionicons name="chevron-forward" size={20} color={theme.colors.onSurfaceSecondary} />
+            </View>
+          </Pressable>
+        )}
 
         {/* Members */}
         <View style={styles.sectionHead}>
@@ -361,6 +382,10 @@ const styles = StyleSheet.create({
     borderRadius: theme.radius.md,
     padding: theme.spacing.md,
     borderWidth: 1, borderColor: theme.colors.border,
+  },
+  mgmtCard: {
+    marginTop: theme.spacing.sm,
+    borderColor: 'rgba(46,204,113,0.35)',
   },
   settingsRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   settingsIcon: {

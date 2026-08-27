@@ -13,7 +13,7 @@ import string
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from pydantic import BaseModel, EmailStr, Field
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Dict, Tuple
 from passlib.context import CryptContext
 import json as _json
 
@@ -1055,6 +1055,603 @@ async def activity(league_id: str, current=Depends(get_current_user)):
     cursor = db.activity.find({"league_id": league_id}, {"_id": 0}).sort("created_at", -1).limit(30)
     items = await cursor.to_list(30)
     return [Activity(**a) for a in items]
+
+# ------------------------------------------------------------
+# Matchday Scoring Engine (Fantavoto + Bench subs + Standings)
+# ------------------------------------------------------------
+FORMATION_SLOTS: Dict[str, Dict[str, int]] = {
+    "4-3-3": {"P": 1, "D": 4, "C": 3, "A": 3},
+    "3-4-3": {"P": 1, "D": 3, "C": 4, "A": 3},
+    "3-5-2": {"P": 1, "D": 3, "C": 5, "A": 2},
+    "4-4-2": {"P": 1, "D": 4, "C": 4, "A": 2},
+    "4-5-1": {"P": 1, "D": 4, "C": 5, "A": 1},
+    "5-3-2": {"P": 1, "D": 5, "C": 3, "A": 2},
+    "5-4-1": {"P": 1, "D": 5, "C": 4, "A": 1},
+}
+
+PENALTY_SAVED_BONUS = 3.0
+PENALTY_MISSED_BONUS = -3.0
+OWN_GOAL_BONUS = -2.0
+
+
+class PlayerRatingIn(BaseModel):
+    player_id: str
+    base_vote: float = Field(ge=0, le=10)
+    goals: int = 0
+    assists: int = 0
+    yellow: int = 0
+    red: int = 0
+    own_goal: int = 0
+    penalty_saved: int = 0
+    penalty_missed: int = 0
+    played: bool = True
+
+
+class PlayerRating(BaseModel):
+    league_id: str
+    matchday: int
+    player_id: str
+    player_name: str
+    role: Role
+    team: str
+    base_vote: float
+    goals: int = 0
+    assists: int = 0
+    yellow: int = 0
+    red: int = 0
+    own_goal: int = 0
+    penalty_saved: int = 0
+    penalty_missed: int = 0
+    played: bool = True
+    fantavoto: float = 0.0
+
+
+class MockRatingsBody(BaseModel):
+    chaos: float = Field(default=0.5, ge=0, le=1)
+
+
+class ManagerScore(BaseModel):
+    user_id: str
+    user_name: str
+    team_name: str
+    formation: str
+    fantavoto: float
+    goals_scored: int
+    starters: List[dict]  # {player_id, name, role, fantavoto, from_bench: bool}
+    bench_used: List[str]  # player_ids that came in
+
+
+class SettleReport(BaseModel):
+    league_id: str
+    matchday: int
+    settled_at: datetime
+    fixtures: List[dict]  # {home_user_id, away_user_id, home_score, away_score, home_fv, away_fv, is_bye}
+    scores: List[ManagerScore]
+
+
+def compute_fantavoto(rating: dict, role: str, regs: dict) -> float:
+    """Apply regulations bonus/malus to a single player rating."""
+    if not rating.get("played", True):
+        return 0.0
+    fv = float(rating.get("base_vote") or 0.0)
+    goals = int(rating.get("goals") or 0)
+    assists = int(rating.get("assists") or 0)
+    yellow = int(rating.get("yellow") or 0)
+    red = int(rating.get("red") or 0)
+    own_goal = int(rating.get("own_goal") or 0)
+    pen_saved = int(rating.get("penalty_saved") or 0)
+    pen_missed = int(rating.get("penalty_missed") or 0)
+
+    if role == "A":
+        fv += goals * float(regs.get("goal_bonus_a", 3.0))
+    elif role == "C":
+        fv += goals * float(regs.get("goal_bonus_c", 3.5))
+    elif role == "D":
+        fv += goals * float(regs.get("goal_bonus_d", 4.0))
+    # Goalkeeper goals are extremely rare, no default bonus
+
+    fv += assists * float(regs.get("assist_bonus", 1.0))
+    fv += yellow * float(regs.get("yellow_card", -0.5))
+    fv += red * float(regs.get("red_card", -1.0))
+    fv += pen_saved * PENALTY_SAVED_BONUS
+    fv += pen_missed * PENALTY_MISSED_BONUS
+    fv += own_goal * OWN_GOAL_BONUS
+
+    return round(fv, 2)
+
+
+def fantavoto_to_goals(fv: float) -> int:
+    """Classic Fantacalcio conversion: 66=1, 72=2, 78=3, ..."""
+    if fv < 66:
+        return 0
+    return int((fv - 60) // 6)
+
+
+async def _auto_lineup_for_user(league_id: str, user_id: str, formation: str = "4-3-3") -> Tuple[List[dict], List[dict]]:
+    """Build starters + bench based on the user's roster.
+    Sort roster by player avg_vote descending, then fill slots by role.
+    Returns (starters, bench) each a list of player docs with role/name/etc.
+    """
+    roster = await db.rosters.find_one({"league_id": league_id, "user_id": user_id}, {"_id": 0})
+    if not roster or not roster.get("entries"):
+        return [], []
+    pids = [e["player_id"] for e in roster["entries"]]
+    players = await db.players.find({"id": {"$in": pids}}, {"_id": 0}).to_list(500)
+    slots = FORMATION_SLOTS.get(formation, FORMATION_SLOTS["4-3-3"])
+
+    by_role: Dict[str, List[dict]] = {"P": [], "D": [], "C": [], "A": []}
+    for p in players:
+        by_role.setdefault(p["role"], []).append(p)
+    for r in by_role:
+        by_role[r].sort(key=lambda x: (float(x.get("avg_vote") or 0), int(x.get("price") or 0)), reverse=True)
+
+    starters: List[dict] = []
+    bench: List[dict] = []
+    for role, count in slots.items():
+        pool = by_role.get(role, [])
+        starters.extend(pool[:count])
+        # bench: up to 3 P substitutes for P (usually 1), others: rest of role
+        bench.extend(pool[count:])
+    return starters, bench
+
+
+async def _load_ratings_map(league_id: str, matchday: int) -> Dict[str, dict]:
+    docs = await db.player_ratings.find(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    ).to_list(5000)
+    return {d["player_id"]: d for d in docs}
+
+
+async def _regulations_dict(league_id: str) -> dict:
+    r = await db.regulations.find_one({"league_id": league_id}, {"_id": 0})
+    if not r:
+        r = Regulations(league_id=league_id).model_dump()
+    return r
+
+
+async def _lineup_for_user(league_id: str, matchday: int, user_id: str) -> Tuple[str, List[dict], List[dict]]:
+    """Return (formation, starters, bench) for a user in this matchday.
+    Uses saved lineup if present, otherwise auto-generates.
+    """
+    saved = await db.matchday_lineups.find_one(
+        {"league_id": league_id, "matchday": matchday, "user_id": user_id}, {"_id": 0}
+    )
+    if saved and saved.get("starters"):
+        pids = list(saved["starters"]) + list(saved.get("bench", []))
+        players = await db.players.find({"id": {"$in": pids}}, {"_id": 0}).to_list(500)
+        by_id = {p["id"]: p for p in players}
+        starters = [by_id[pid] for pid in saved["starters"] if pid in by_id]
+        bench = [by_id[pid] for pid in saved.get("bench", []) if pid in by_id]
+        return saved.get("formation", "4-3-3"), starters, bench
+    # auto
+    formation = "4-3-3"
+    starters, bench = await _auto_lineup_for_user(league_id, user_id, formation)
+    return formation, starters, bench
+
+
+def _apply_bench_subs(
+    starters: List[dict], bench: List[dict], ratings_map: Dict[str, dict], regs: dict
+) -> Tuple[List[dict], List[str]]:
+    """Replace any starter without a rating or that didn't play with a bench player of the same role.
+    Returns (final_lineup_with_fv, bench_ids_used).
+    Each entry in final list is a dict: {player_id, name, role, fantavoto, from_bench}
+    """
+    bench_by_role: Dict[str, List[dict]] = {"P": [], "D": [], "C": [], "A": []}
+    for b in bench:
+        bench_by_role.setdefault(b["role"], []).append(b)
+
+    result: List[dict] = []
+    bench_used_ids: List[str] = []
+    for st in starters:
+        r = ratings_map.get(st["id"])
+        if r and r.get("played", True):
+            fv = compute_fantavoto(r, st["role"], regs)
+            result.append({
+                "player_id": st["id"], "name": st["name"], "role": st["role"],
+                "fantavoto": fv, "from_bench": False,
+            })
+            continue
+        # try substitute from bench (same role) that HAS a rating and played
+        sub = None
+        pool = bench_by_role.get(st["role"], [])
+        for cand in pool:
+            cr = ratings_map.get(cand["id"])
+            if cr and cr.get("played", True):
+                sub = cand
+                break
+        if sub is not None:
+            pool.remove(sub)
+            fv = compute_fantavoto(ratings_map[sub["id"]], sub["role"], regs)
+            result.append({
+                "player_id": sub["id"], "name": sub["name"], "role": sub["role"],
+                "fantavoto": fv, "from_bench": True,
+            })
+            bench_used_ids.append(sub["id"])
+        else:
+            # no substitute available: slot yields 0 fantavoto
+            result.append({
+                "player_id": st["id"], "name": st["name"], "role": st["role"],
+                "fantavoto": 0.0, "from_bench": False,
+            })
+    return result, bench_used_ids
+
+
+# ---- Endpoints ----
+
+@api.get("/leagues/{league_id}/matchday/{matchday}/ratings", response_model=List[PlayerRating])
+async def get_matchday_ratings(league_id: str, matchday: int, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    cursor = db.player_ratings.find(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    ).sort("player_name", 1)
+    return [PlayerRating(**r) for r in await cursor.to_list(5000)]
+
+
+class ManualRatingsBody(BaseModel):
+    ratings: List[PlayerRatingIn]
+
+
+@api.post("/leagues/{league_id}/matchday/{matchday}/ratings/manual", response_model=dict)
+async def upload_ratings_manual(
+    league_id: str, matchday: int, body: ManualRatingsBody, current=Depends(get_current_user)
+):
+    """Admin uploads a list of player ratings for a specific matchday."""
+    await require_admin(league_id, current)
+    if matchday < 1 or matchday > 38:
+        raise HTTPException(400, "Giornata non valida")
+    if not body.ratings:
+        raise HTTPException(400, "Lista voti vuota")
+
+    # look up players once to enrich ratings with name/role/team
+    pids = [r.player_id for r in body.ratings]
+    players = await db.players.find({"id": {"$in": pids}}, {"_id": 0}).to_list(len(pids))
+    p_by_id = {p["id"]: p for p in players}
+    if len(p_by_id) != len(set(pids)):
+        missing = [pid for pid in pids if pid not in p_by_id]
+        raise HTTPException(400, f"Giocatori non trovati: {missing[:5]}")
+
+    regs = await _regulations_dict(league_id)
+
+    # delete existing ratings for this matchday (idempotent)
+    await db.player_ratings.delete_many({"league_id": league_id, "matchday": matchday})
+    docs = []
+    for r in body.ratings:
+        p = p_by_id[r.player_id]
+        d = r.model_dump()
+        d.update({
+            "league_id": league_id,
+            "matchday": matchday,
+            "player_name": p["name"],
+            "role": p["role"],
+            "team": p["team"],
+        })
+        d["fantavoto"] = compute_fantavoto(d, p["role"], regs)
+        docs.append(d)
+    await db.player_ratings.insert_many(docs)
+    return {"inserted": len(docs), "matchday": matchday, "source": "manual"}
+
+
+@api.post("/leagues/{league_id}/matchday/{matchday}/ratings/mock", response_model=dict)
+async def generate_mock_ratings(
+    league_id: str, matchday: int, body: MockRatingsBody, current=Depends(get_current_user)
+):
+    """Generate smart mock ratings for every player owned by any manager in this league."""
+    await require_admin(league_id, current)
+    if matchday < 1 or matchday > 38:
+        raise HTTPException(400, "Giornata non valida")
+
+    # collect all player_ids from all rosters in this league
+    rosters = await db.rosters.find({"league_id": league_id}, {"_id": 0}).to_list(200)
+    pids: set = set()
+    for r in rosters:
+        for e in (r.get("entries") or []):
+            pids.add(e["player_id"])
+    if not pids:
+        raise HTTPException(400, "Nessun giocatore in rosa per questa lega")
+
+    players = await db.players.find({"id": {"$in": list(pids)}}, {"_id": 0}).to_list(len(pids))
+    regs = await _regulations_dict(league_id)
+
+    # Seed the random generator deterministically per (league, matchday) so mock is reproducible
+    rng = random.Random(f"{league_id}-{matchday}-mock")
+    chaos = max(0.0, min(1.0, float(body.chaos)))
+
+    await db.player_ratings.delete_many({"league_id": league_id, "matchday": matchday})
+    docs = []
+    for p in players:
+        base_center = float(p.get("avg_vote") or 6.0)
+        # base_vote sampled around avg with variance driven by `chaos`
+        base_vote = base_center + rng.uniform(-1.0, 1.0) * (0.4 + chaos * 0.8)
+        base_vote = max(3.0, min(9.5, round(base_vote, 1)))
+        played = rng.random() > (0.05 + chaos * 0.10)  # 85-95% chance of playing
+
+        goals = 0
+        assists = 0
+        yellow = 0
+        red = 0
+        own_goal = 0
+        pen_saved = 0
+        pen_missed = 0
+
+        if played:
+            role = p["role"]
+            price = int(p.get("price") or 1)
+            # scoring probabilities scaled by role and price
+            if role == "A":
+                p_goal = 0.18 + min(price, 50) / 300.0
+                p_assist = 0.10
+            elif role == "C":
+                p_goal = 0.09 + min(price, 30) / 400.0
+                p_assist = 0.14
+            elif role == "D":
+                p_goal = 0.04 + min(price, 20) / 500.0
+                p_assist = 0.06
+            else:  # P
+                p_goal = 0.002
+                p_assist = 0.01
+            if rng.random() < p_goal * (1 + chaos):
+                goals = 1 if rng.random() > 0.15 else 2
+            if rng.random() < p_assist * (1 + chaos * 0.5):
+                assists = 1
+            if rng.random() < 0.14:
+                yellow = 1
+            if rng.random() < 0.02:
+                red = 1
+            if role == "P" and rng.random() < 0.03:
+                pen_saved = 1
+            if role in ("A", "C") and rng.random() < 0.015:
+                pen_missed = 1
+            if rng.random() < 0.008:
+                own_goal = 1
+
+        d = {
+            "league_id": league_id,
+            "matchday": matchday,
+            "player_id": p["id"],
+            "player_name": p["name"],
+            "role": p["role"],
+            "team": p["team"],
+            "base_vote": base_vote,
+            "goals": goals,
+            "assists": assists,
+            "yellow": yellow,
+            "red": red,
+            "own_goal": own_goal,
+            "penalty_saved": pen_saved,
+            "penalty_missed": pen_missed,
+            "played": played,
+        }
+        d["fantavoto"] = compute_fantavoto(d, p["role"], regs)
+        docs.append(d)
+
+    if docs:
+        await db.player_ratings.insert_many(docs)
+    return {"inserted": len(docs), "matchday": matchday, "source": "mock", "chaos": chaos}
+
+
+@api.get("/leagues/{league_id}/matchday/{matchday}/status", response_model=dict)
+async def matchday_status(league_id: str, matchday: int, current=Depends(get_current_user)):
+    await require_membership(league_id, current)
+    r_count = await db.player_ratings.count_documents(
+        {"league_id": league_id, "matchday": matchday}
+    )
+    settled = await db.matchday_results.find_one(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    )
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0}) or {}
+    return {
+        "league_id": league_id,
+        "matchday": matchday,
+        "start_matchday": int(league.get("start_matchday") or 1),
+        "has_ratings": r_count > 0,
+        "ratings_count": r_count,
+        "settled": bool(settled),
+        "settled_at": (settled or {}).get("settled_at"),
+    }
+
+
+@api.post("/leagues/{league_id}/matchday/{matchday}/settle", response_model=SettleReport)
+async def settle_matchday(
+    league_id: str, matchday: int, current=Depends(get_current_user)
+):
+    """Compute fantavoto per manager (with bench subs), update fixtures & standings."""
+    await require_admin(league_id, current)
+    if matchday < 1 or matchday > 38:
+        raise HTTPException(400, "Giornata non valida")
+
+    ratings_map = await _load_ratings_map(league_id, matchday)
+    if not ratings_map:
+        raise HTTPException(400, "Non ci sono voti caricati per questa giornata")
+
+    # prevent double-settle
+    existing = await db.matchday_results.find_one({"league_id": league_id, "matchday": matchday}, {"_id": 0})
+    if existing:
+        raise HTTPException(409, "Questa giornata è già stata calcolata. Ripristinala prima di ricalcolare.")
+
+    regs = await _regulations_dict(league_id)
+
+    # fixtures for this matchday
+    fixtures = await db.fixtures.find(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    ).to_list(50)
+    if not fixtures:
+        raise HTTPException(400, "Nessuna partita in calendario per questa giornata")
+
+    # collect all managers involved (from fixtures)
+    manager_ids: List[str] = []
+    for f in fixtures:
+        if f.get("home_user_id"): manager_ids.append(f["home_user_id"])
+        if f.get("away_user_id"): manager_ids.append(f["away_user_id"])
+        if f.get("bye_user_id"): manager_ids.append(f["bye_user_id"])
+    manager_ids = list(set(manager_ids))
+
+    memberships = await db.memberships.find(
+        {"league_id": league_id, "user_id": {"$in": manager_ids}}, {"_id": 0}
+    ).to_list(50)
+    mem_by_uid = {m["user_id"]: m for m in memberships}
+
+    # compute score per manager
+    scores: List[ManagerScore] = []
+    scores_by_uid: Dict[str, ManagerScore] = {}
+    for uid in manager_ids:
+        formation, starters, bench = await _lineup_for_user(league_id, matchday, uid)
+        final_lineup, bench_used = _apply_bench_subs(starters, bench, ratings_map, regs)
+        total_fv = round(sum(item["fantavoto"] for item in final_lineup), 2)
+        goals = fantavoto_to_goals(total_fv)
+        mem = mem_by_uid.get(uid, {})
+        ms = ManagerScore(
+            user_id=uid,
+            user_name=mem.get("user_name", "—"),
+            team_name=mem.get("team_name", "—"),
+            formation=formation,
+            fantavoto=total_fv,
+            goals_scored=goals,
+            starters=final_lineup,
+            bench_used=bench_used,
+        )
+        scores.append(ms)
+        scores_by_uid[uid] = ms
+
+    # apply results to fixtures + standings
+    fixture_results: List[dict] = []
+    for f in fixtures:
+        if f.get("is_bye"):
+            fixture_results.append({
+                "matchday": matchday, "is_bye": True,
+                "bye_user_id": f.get("bye_user_id"),
+                "bye_team": f.get("bye_team"),
+            })
+            continue
+        h = scores_by_uid.get(f["home_user_id"])
+        a = scores_by_uid.get(f["away_user_id"])
+        if not h or not a:
+            continue
+        hg, ag = h.goals_scored, a.goals_scored
+        fixture_results.append({
+            "matchday": matchday, "is_bye": False,
+            "home_user_id": f["home_user_id"], "home_team": f.get("home_team"),
+            "away_user_id": f["away_user_id"], "away_team": f.get("away_team"),
+            "home_fv": h.fantavoto, "away_fv": a.fantavoto,
+            "home_score": hg, "away_score": ag,
+        })
+        # update fixture with result
+        await db.fixtures.update_one(
+            {"league_id": league_id, "matchday": matchday,
+             "home_user_id": f["home_user_id"], "away_user_id": f["away_user_id"]},
+            {"$set": {
+                "home_score": hg, "away_score": ag,
+                "home_fv": h.fantavoto, "away_fv": a.fantavoto,
+                "settled": True,
+            }}
+        )
+        # update standings for both
+        for uid, gf, ga in [(f["home_user_id"], hg, ag), (f["away_user_id"], ag, hg)]:
+            win = 1 if gf > ga else 0
+            draw = 1 if gf == ga else 0
+            loss = 1 if gf < ga else 0
+            pts = 3 if win else (1 if draw else 0)
+            await db.standings.update_one(
+                {"league_id": league_id, "user_id": uid},
+                {
+                    "$inc": {
+                        "played": 1, "wins": win, "draws": draw, "losses": loss,
+                        "points": pts, "goals_for": gf, "goals_against": ga,
+                    },
+                    "$setOnInsert": {
+                        "league_id": league_id, "user_id": uid,
+                        "user_name": mem_by_uid.get(uid, {}).get("user_name", "—"),
+                        "team_name": mem_by_uid.get(uid, {}).get("team_name", "—"),
+                    },
+                },
+                upsert=True,
+            )
+
+    settled_at = datetime.now(timezone.utc)
+    report = {
+        "league_id": league_id,
+        "matchday": matchday,
+        "settled_at": settled_at.isoformat(),
+        "fixtures": fixture_results,
+        "scores": [s.model_dump() for s in scores],
+    }
+    await db.matchday_results.insert_one(dict(report))
+
+    # activity entry
+    await db.activity.insert_one({
+        "id": str(uuid.uuid4()),
+        "league_id": league_id,
+        "kind": "info",
+        "title": f"Giornata {matchday}ª calcolata",
+        "subtitle": f"{len([r for r in fixture_results if not r.get('is_bye')])} match aggiornati in classifica",
+        "created_at": settled_at.isoformat(),
+    })
+
+    return SettleReport(
+        league_id=league_id, matchday=matchday, settled_at=settled_at,
+        fixtures=fixture_results, scores=scores,
+    )
+
+
+@api.get("/leagues/{league_id}/matchday/{matchday}/results", response_model=Optional[SettleReport])
+async def get_matchday_results(
+    league_id: str, matchday: int, current=Depends(get_current_user)
+):
+    await require_membership(league_id, current)
+    doc = await db.matchday_results.find_one(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    )
+    if not doc:
+        return None
+    return SettleReport(
+        league_id=doc["league_id"], matchday=doc["matchday"],
+        settled_at=doc["settled_at"],
+        fixtures=doc.get("fixtures", []),
+        scores=[ManagerScore(**s) for s in doc.get("scores", [])],
+    )
+
+
+@api.post("/leagues/{league_id}/matchday/{matchday}/reset", response_model=dict)
+async def reset_matchday(
+    league_id: str, matchday: int, current=Depends(get_current_user)
+):
+    """Undo settlement: subtract from standings, clear fixture results, delete results record."""
+    await require_admin(league_id, current)
+    existing = await db.matchday_results.find_one(
+        {"league_id": league_id, "matchday": matchday}, {"_id": 0}
+    )
+    if not existing:
+        raise HTTPException(404, "Questa giornata non è stata calcolata")
+
+    # subtract from standings
+    for fr in existing.get("fixtures", []):
+        if fr.get("is_bye"): continue
+        for uid, gf, ga in [
+            (fr.get("home_user_id"), fr.get("home_score", 0), fr.get("away_score", 0)),
+            (fr.get("away_user_id"), fr.get("away_score", 0), fr.get("home_score", 0)),
+        ]:
+            if not uid: continue
+            win = 1 if gf > ga else 0
+            draw = 1 if gf == ga else 0
+            loss = 1 if gf < ga else 0
+            pts = 3 if win else (1 if draw else 0)
+            await db.standings.update_one(
+                {"league_id": league_id, "user_id": uid},
+                {"$inc": {
+                    "played": -1, "wins": -win, "draws": -draw, "losses": -loss,
+                    "points": -pts, "goals_for": -gf, "goals_against": -ga,
+                }},
+            )
+        # clear fixture result
+        await db.fixtures.update_one(
+            {"league_id": league_id, "matchday": matchday,
+             "home_user_id": fr.get("home_user_id"), "away_user_id": fr.get("away_user_id")},
+            {"$unset": {"home_score": "", "away_score": "", "home_fv": "", "away_fv": "", "settled": ""}}
+        )
+
+    await db.matchday_results.delete_one({"league_id": league_id, "matchday": matchday})
+    # keep ratings, admin may want to re-run settle
+    return {"reset": True, "matchday": matchday}
+
 
 # ------------------------------------------------------------
 # Dashboard summary

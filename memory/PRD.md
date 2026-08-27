@@ -51,3 +51,9 @@ Cross-platform Expo React Native mobile app for **Italian Fantasy Football (Fant
 
 ## Recently completed
 - **Giornata di partenza personalizzata** (v8): admin can pick which Serie A matchday (1-38) the league starts tracking from. Fixtures are numbered accordingly. Editable pre-kickoff via `PATCH /api/leagues/{id}/settings`.
+- **Motore Fantavoto + Chiusura Giornata** (v9):
+  - `POST /api/leagues/{id}/matchday/{n}/ratings/manual` – admin uploads JSON list of `PlayerRatingIn` records
+  - `POST /api/leagues/{id}/matchday/{n}/ratings/mock` – deterministic smart mock generator (based on `avg_vote`, price, role, chaos level)
+  - `POST /api/leagues/{id}/matchday/{n}/settle` – engine applies regulations (goal by role, assist, cards, penalties, own goal), auto-picks starting XI from roster, substitutes titolari without rating from bench of same role, converts total fantavoto → goals (66=1, 72=2, +6 per gol), updates fixtures + standings
+  - `POST /api/leagues/{id}/matchday/{n}/reset` – reversible settlement (subtracts from standings, clears fixture results)
+  - Frontend: dedicated `/matchday` admin screen with matchday picker (1-38), status pills, chaos-level selector, generate/upload/settle/reset buttons, results view (fixtures + top scorers)

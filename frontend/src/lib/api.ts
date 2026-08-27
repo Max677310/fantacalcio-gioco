@@ -99,4 +99,24 @@ export const api = {
   regulations: (leagueId: string) => request<any>(`/regulations/${leagueId}`),
   updateRegulations: (leagueId: string, body: any) =>
     request<any>(`/regulations/${leagueId}`, { method: 'PUT', body: JSON.stringify(body) }),
+
+  // Matchday scoring engine
+  matchdayStatus: (leagueId: string, matchday: number) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/status`),
+  matchdayRatings: (leagueId: string, matchday: number) =>
+    request<any[]>(`/leagues/${leagueId}/matchday/${matchday}/ratings`),
+  generateMockRatings: (leagueId: string, matchday: number, chaos: number = 0.5) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/ratings/mock`, {
+      method: 'POST', body: JSON.stringify({ chaos }),
+    }),
+  uploadRatingsManual: (leagueId: string, matchday: number, ratings: any[]) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/ratings/manual`, {
+      method: 'POST', body: JSON.stringify({ ratings }),
+    }),
+  settleMatchday: (leagueId: string, matchday: number) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/settle`, { method: 'POST' }),
+  matchdayResults: (leagueId: string, matchday: number) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/results`),
+  resetMatchday: (leagueId: string, matchday: number) =>
+    request<any>(`/leagues/${leagueId}/matchday/${matchday}/reset`, { method: 'POST' }),
 };
