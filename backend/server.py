@@ -45,13 +45,20 @@ pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 # ------------------------------------------------------------
-# Email (Emergent managed) — password reset
+# Email — supports BOTH Emergent-managed proxy (dev/preview)
+# AND real Resend API (self-hosted deploys)
 # ------------------------------------------------------------
 EMAIL_BASE_URL = "https://integrations.emergentagent.com"
-EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY")
+EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY")           # Emergent path
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")          # Self-host path
+EMAIL_FROM = os.environ.get("EMAIL_FROM")                  # Required when using Resend directly (e.g. "Fantacalcio <noreply@yourdomain.com>")
 EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME") or "Fantacalcio Manager"
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 _APP_HOST = os.environ.get("APP_PUBLIC_URL") or "https://fantacalcio.app"
+
+# Preferred provider: Resend direct if RESEND_API_KEY is set (self-host),
+# otherwise fall back to Emergent-managed proxy.
+EMAIL_PROVIDER = "resend" if RESEND_API_KEY else ("emergent" if EMAIL_KEY else None)
 
 _SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
 _CRED_ASK = (
@@ -125,34 +132,81 @@ def _assert_safe_email(subject: str, html: str) -> None:
 
 
 async def send_email(*, to: str, subject: str, html: str) -> Optional[str]:
-    """Send an email via Emergent managed integration. Server-side templates only."""
+    """Send a transactional email.
+
+    Two providers supported:
+    - `resend`  : Real Resend API (production self-hosting). Requires
+                  `RESEND_API_KEY` and `EMAIL_FROM` (must be a domain you
+                  verified on resend.com/domains).
+    - `emergent`: Emergent-managed proxy (dev/preview on the platform).
+                  Requires `EMERGENT_EMAIL_KEY`.
+    Server-side templates only, no caller input.
+    """
     _assert_safe_email(subject, html)
-    if not EMAIL_KEY:
-        logging.getLogger("fantacalcio").warning("EMERGENT_EMAIL_KEY missing; email not sent")
-        return None
-    payload = {
-        "to": [to], "subject": subject, "html": html,
-        "from_name": EMAIL_FROM_NAME,
-    }
-    if EMAIL_REPLY_TO:
-        payload["contact_email"] = EMAIL_REPLY_TO
-    try:
-        async with httpx.AsyncClient(timeout=30) as client_http:
-            resp = await client_http.post(
-                f"{EMAIL_BASE_URL}/api/v1/email/send",
-                headers={"X-Email-Key": EMAIL_KEY},
-                json=payload,
+    if EMAIL_PROVIDER == "resend":
+        if not EMAIL_FROM:
+            logging.getLogger("fantacalcio").warning(
+                "RESEND_API_KEY set but EMAIL_FROM missing; email not sent"
             )
-        resp.raise_for_status()
-        return resp.json().get("id")
-    except httpx.HTTPStatusError as e:
-        logging.getLogger("fantacalcio").error(
-            "Email send failed: %s %s", e.response.status_code, e.response.text
-        )
-        raise HTTPException(status_code=502, detail="Errore invio email")
-    except Exception as e:
-        logging.getLogger("fantacalcio").error("Email send error: %s", e)
-        raise HTTPException(status_code=500, detail="Errore invio email")
+            return None
+        payload = {
+            "from": EMAIL_FROM,
+            "to": [to],
+            "subject": subject,
+            "html": html,
+        }
+        if EMAIL_REPLY_TO:
+            payload["reply_to"] = EMAIL_REPLY_TO
+        try:
+            async with httpx.AsyncClient(timeout=30) as client_http:
+                resp = await client_http.post(
+                    "https://api.resend.com/emails",
+                    headers={
+                        "Authorization": f"Bearer {RESEND_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            resp.raise_for_status()
+            return resp.json().get("id")
+        except httpx.HTTPStatusError as e:
+            logging.getLogger("fantacalcio").error(
+                "Resend send failed: %s %s", e.response.status_code, e.response.text
+            )
+            raise HTTPException(status_code=502, detail="Errore invio email")
+        except Exception as e:
+            logging.getLogger("fantacalcio").error("Resend send error: %s", e)
+            raise HTTPException(status_code=500, detail="Errore invio email")
+
+    if EMAIL_PROVIDER == "emergent":
+        payload = {
+            "to": [to], "subject": subject, "html": html,
+            "from_name": EMAIL_FROM_NAME,
+        }
+        if EMAIL_REPLY_TO:
+            payload["contact_email"] = EMAIL_REPLY_TO
+        try:
+            async with httpx.AsyncClient(timeout=30) as client_http:
+                resp = await client_http.post(
+                    f"{EMAIL_BASE_URL}/api/v1/email/send",
+                    headers={"X-Email-Key": EMAIL_KEY},
+                    json=payload,
+                )
+            resp.raise_for_status()
+            return resp.json().get("id")
+        except httpx.HTTPStatusError as e:
+            logging.getLogger("fantacalcio").error(
+                "Emergent email failed: %s %s", e.response.status_code, e.response.text
+            )
+            raise HTTPException(status_code=502, detail="Errore invio email")
+        except Exception as e:
+            logging.getLogger("fantacalcio").error("Emergent email error: %s", e)
+            raise HTTPException(status_code=500, detail="Errore invio email")
+
+    logging.getLogger("fantacalcio").warning(
+        "No email provider configured (set RESEND_API_KEY or EMERGENT_EMAIL_KEY); skipping send"
+    )
+    return None
 
 app = FastAPI(title="Fantacalcio API")
 api = APIRouter(prefix="/api")

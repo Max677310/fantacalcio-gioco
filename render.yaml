@@ -1,0 +1,53 @@
+# --------------------------------------------------------------------
+# Render.com — Blueprint for Fantacalcio Manager backend
+#
+# HOW TO USE
+#   1. Push this repo (including this file at the project root) to GitHub.
+#   2. On Render → New → Blueprint → point at your repo.
+#   3. Render reads this file and provisions the service automatically.
+#   4. Fill in the SYNCED env vars (MONGO_URL, RESEND_API_KEY, EMAIL_FROM)
+#      in the Render dashboard when prompted.
+#
+# NOTE: Render's *free* web service tier sleeps after ~15 min of inactivity
+#       and cold-starts in ~30 s. Perfect for a small friends' league.
+#       Upgrade to Starter (7$/mo) to eliminate cold starts.
+# --------------------------------------------------------------------
+services:
+  - type: web
+    name: fantacalcio-backend
+    runtime: python
+    plan: free
+    rootDir: backend
+    region: frankfurt        # closest to Italy — change if you prefer
+    branch: main
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/
+    autoDeploy: true
+
+    envVars:
+      # --- Database (MongoDB Atlas M0 free — mongodb+srv://...) ---
+      - key: MONGO_URL
+        sync: false          # user pastes value in dashboard
+      - key: DB_NAME
+        value: fantacalcio
+
+      # --- JWT (auto-generated once, never rotate unless you want to log everyone out) ---
+      - key: JWT_SECRET
+        generateValue: true
+
+      # --- Email provider (Resend direct — self-host mode) ---
+      - key: RESEND_API_KEY
+        sync: false          # get from https://resend.com/api-keys
+      - key: EMAIL_FROM
+        sync: false          # e.g. 'Fantacalcio <noreply@yourdomain.com>'
+      - key: EMAIL_FROM_NAME
+        value: Fantacalcio Manager
+
+      # --- Optional: reply-to address (leave empty to disable) ---
+      - key: EMAIL_REPLY_TO
+        sync: false
+
+      # --- Optional: your deployed frontend URL, used in email templates ---
+      - key: APP_PUBLIC_URL
+        sync: false
