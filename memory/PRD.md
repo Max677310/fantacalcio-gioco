@@ -50,6 +50,7 @@ Cross-platform Expo React Native mobile app for **Italian Fantasy Football (Fant
 - Automated Monday API (manual admin upload / smart mock ratings + auto bench subs)
 
 ## Recently completed
+- **Timer Asta 15s + Passo** (v10): each new bid restarts a 15-second countdown; when it expires the player is auto-assigned to the highest bidder. New endpoint `POST /api/auction/{id}/pass` — non-bidders can withdraw; if everyone else passes the player is auto-assigned immediately. Frontend shows live countdown (green→gold→red), "Passo" button (disabled for current bidder), and "VENDUTO" banner after auto-assign.
 - **Giornata di partenza personalizzata** (v8): admin can pick which Serie A matchday (1-38) the league starts tracking from. Fixtures are numbered accordingly. Editable pre-kickoff via `PATCH /api/leagues/{id}/settings`.
 - **Motore Fantavoto + Chiusura Giornata** (v9):
   - `POST /api/leagues/{id}/matchday/{n}/ratings/manual` – admin uploads JSON list of `PlayerRatingIn` records

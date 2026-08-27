@@ -159,6 +159,10 @@ class AuctionState(BaseModel):
     current_bidder_id: Optional[str]
     current_bidder_name: Optional[str]
     status: Literal["idle", "running", "sold", "ended"]
+    bid_expires_at: Optional[datetime] = None
+    passed_user_ids: List[str] = []
+    bid_countdown_seconds: int = 15
+    seconds_remaining: Optional[float] = None
 
 class Regulations(BaseModel):
     league_id: str
@@ -562,6 +566,120 @@ async def get_player(player_id: str):
 # ------------------------------------------------------------
 # Auction routes
 # ------------------------------------------------------------
+AUCTION_COUNTDOWN_SECONDS = 15
+
+
+async def _perform_assign(league_id: str, st: dict) -> dict:
+    """Assign the currently active player to the highest bidder.
+    Deducts wallet and adds to roster. Returns the new state dict.
+    """
+    winner_id = st.get("current_bidder_id")
+    if not winner_id or not st.get("active_player_id"):
+        return st
+    amount = int(st.get("current_bid") or 0)
+    player_id = st["active_player_id"]
+
+    # Prevent duplicate assignment
+    existing_roster = await db.rosters.find_one(
+        {"league_id": league_id, "user_id": winner_id}, {"_id": 0}
+    )
+    if existing_roster:
+        already = any(e["player_id"] == player_id for e in existing_roster.get("entries", []))
+        if already:
+            # nothing to do
+            return st
+
+    wallet = await db.wallets.find_one({"league_id": league_id, "user_id": winner_id})
+    if not wallet:
+        return st
+    if amount > wallet.get("remaining", 0):
+        # winner doesn't have enough — revert bidder and let others rebid
+        new_state = {
+            "current_bidder_id": None,
+            "current_bidder_name": None,
+            "bid_expires_at": None,
+            "passed_user_ids": [],
+        }
+        await db.auction_state.update_one({"league_id": league_id}, {"$set": new_state})
+        st.update(new_state)
+        return st
+
+    await db.wallets.update_one(
+        {"league_id": league_id, "user_id": winner_id},
+        {"$inc": {"spent": amount, "remaining": -amount}},
+    )
+    await db.rosters.update_one(
+        {"league_id": league_id, "user_id": winner_id},
+        {"$push": {"entries": {"player_id": player_id, "price_paid": amount}}},
+        upsert=True,
+    )
+    # Keep active_player_id so UI can show the winner briefly (status=sold)
+    new_state = {
+        "status": "sold",
+        "bid_expires_at": None,
+        "passed_user_ids": [],
+    }
+    await db.auction_state.update_one({"league_id": league_id}, {"$set": new_state})
+    st.update(new_state)
+
+    # Log activity
+    p = await db.players.find_one({"id": player_id}, {"_id": 0})
+    if p:
+        await db.activity.insert_one({
+            "id": str(uuid.uuid4()),
+            "league_id": league_id,
+            "kind": "bid",
+            "title": f"{p.get('name')} venduto a {amount}",
+            "subtitle": f"Aggiudicato da {st.get('current_bidder_name') or 'un manager'}",
+            "created_at": now_iso(),
+        })
+    return st
+
+
+def _state_with_countdown(st: dict) -> dict:
+    """Attach `seconds_remaining` derived from `bid_expires_at`."""
+    exp = st.get("bid_expires_at")
+    if not exp:
+        st["seconds_remaining"] = None
+        return st
+    if isinstance(exp, str):
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        except Exception:
+            exp_dt = None
+    else:
+        exp_dt = exp
+    if not exp_dt:
+        st["seconds_remaining"] = None
+        return st
+    now = datetime.now(timezone.utc)
+    if exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    delta = (exp_dt - now).total_seconds()
+    st["seconds_remaining"] = max(0.0, round(delta, 1))
+    return st
+
+
+async def _maybe_expire_auction(league_id: str, st: dict) -> dict:
+    """If bid timer has expired and there is a bidder, auto-assign."""
+    if st.get("status") != "running":
+        return st
+    exp = st.get("bid_expires_at")
+    if not exp or not st.get("current_bidder_id"):
+        return st
+    exp_dt = exp
+    if isinstance(exp, str):
+        try:
+            exp_dt = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+        except Exception:
+            return st
+    if exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    if exp_dt <= datetime.now(timezone.utc):
+        st = await _perform_assign(league_id, st)
+    return st
+
+
 @api.get("/auction/{league_id}/state", response_model=AuctionState)
 async def auction_state(league_id: str, current=Depends(get_current_user)):
     await require_membership(league_id, current)
@@ -575,8 +693,14 @@ async def auction_state(league_id: str, current=Depends(get_current_user)):
             "current_bidder_id": None,
             "current_bidder_name": None,
             "status": "running",
+            "bid_expires_at": None,
+            "passed_user_ids": [],
         }
         await db.auction_state.insert_one(dict(st))
+    # Lazy auto-assign if timer expired
+    st = await _maybe_expire_auction(league_id, st)
+    st = _state_with_countdown(st)
+    st["bid_countdown_seconds"] = AUCTION_COUNTDOWN_SECONDS
     return AuctionState(**st)
 
 @api.get("/auction/{league_id}/bids", response_model=List[Bid])
@@ -599,6 +723,10 @@ async def place_bid(league_id: str, body: BidRequest, current=Depends(get_curren
     st = await db.auction_state.find_one({"league_id": league_id}, {"_id": 0})
     if not st or st.get("status") != "running":
         raise HTTPException(400, "Asta non attiva")
+    # If timer has expired, auto-assign first then refuse
+    st = await _maybe_expire_auction(league_id, st)
+    if st.get("status") != "running":
+        raise HTTPException(400, "Il tempo per rilanciare è scaduto")
     if body.amount <= st.get("current_bid", 0):
         raise HTTPException(400, f"Il rilancio deve essere maggiore di {st.get('current_bid', 0)}")
     # Wallet check — user must have enough credits to cover their bid
@@ -619,17 +747,60 @@ async def place_bid(league_id: str, body: BidRequest, current=Depends(get_curren
         "created_at": now_iso(),
     }
     await db.bids.insert_one(dict(bid))
+    new_expiry = datetime.now(timezone.utc) + timedelta(seconds=AUCTION_COUNTDOWN_SECONDS)
     st["current_bid"] = body.amount
     st["current_bidder_id"] = current["id"]
     st["current_bidder_name"] = bidder_label
+    st["bid_expires_at"] = new_expiry.isoformat()
+    st["passed_user_ids"] = []  # a new bid re-opens the round
     await db.auction_state.update_one(
         {"league_id": league_id},
         {"$set": {
             "current_bid": st["current_bid"],
             "current_bidder_id": st["current_bidder_id"],
             "current_bidder_name": st["current_bidder_name"],
+            "bid_expires_at": st["bid_expires_at"],
+            "passed_user_ids": [],
         }}
     )
+    st = _state_with_countdown(st)
+    st["bid_countdown_seconds"] = AUCTION_COUNTDOWN_SECONDS
+    return AuctionState(**st)
+
+
+@api.post("/auction/{league_id}/pass", response_model=AuctionState)
+async def pass_bid(league_id: str, current=Depends(get_current_user)):
+    """User declines to bid on the current player. If all remaining managers pass, auto-assign."""
+    membership = await db.memberships.find_one(
+        {"league_id": league_id, "user_id": current["id"]}
+    )
+    if not membership:
+        raise HTTPException(403, "Non sei membro di questa lega")
+    st = await db.auction_state.find_one({"league_id": league_id}, {"_id": 0})
+    if not st or st.get("status") != "running":
+        raise HTTPException(400, "Asta non attiva")
+    if not st.get("current_bidder_id"):
+        raise HTTPException(400, "Nessuna offerta da passare: attendi un rilancio")
+    if current["id"] == st.get("current_bidder_id"):
+        raise HTTPException(400, "Sei il miglior offerente, non puoi passare")
+
+    passed = list(set(st.get("passed_user_ids") or []) | {current["id"]})
+    st["passed_user_ids"] = passed
+    await db.auction_state.update_one(
+        {"league_id": league_id},
+        {"$set": {"passed_user_ids": passed}},
+    )
+
+    # Check whether all other members (except current bidder) have passed
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0}) or {}
+    member_ids = set(league.get("member_ids") or [])
+    remaining = member_ids - {st["current_bidder_id"]} - set(passed)
+    if not remaining:
+        # everyone else has passed — auto assign
+        st = await _perform_assign(league_id, st)
+
+    st = _state_with_countdown(st)
+    st["bid_countdown_seconds"] = AUCTION_COUNTDOWN_SECONDS
     return AuctionState(**st)
 
 class NextPlayerRequest(BaseModel):
@@ -648,64 +819,32 @@ async def next_player(league_id: str, body: NextPlayerRequest, current=Depends(g
         "current_bidder_id": None,
         "current_bidder_name": None,
         "status": "running",
+        "bid_expires_at": None,
+        "passed_user_ids": [],
     }
     await db.auction_state.update_one(
         {"league_id": league_id},
         {"$set": new_state},
         upsert=True,
     )
+    new_state = _state_with_countdown(new_state)
+    new_state["bid_countdown_seconds"] = AUCTION_COUNTDOWN_SECONDS
     return AuctionState(**new_state)
 
 
 @api.post("/auction/{league_id}/assign", response_model=AuctionState)
 async def assign_current_bid(league_id: str, current=Depends(get_current_user)):
-    """Admin assigns the current active player to the highest bidder, deducts wallet and adds to roster."""
+    """Admin manually assigns the current active player to the highest bidder."""
     await require_admin(league_id, current)
     st = await db.auction_state.find_one({"league_id": league_id}, {"_id": 0})
     if not st or not st.get("active_player_id"):
         raise HTTPException(400, "Nessun giocatore in asta")
     if not st.get("current_bidder_id"):
         raise HTTPException(400, "Nessuna offerta valida da assegnare")
-    winner_id = st["current_bidder_id"]
-    amount = int(st["current_bid"])
-    player_id = st["active_player_id"]
-
-    # Prevent duplicate assignment
-    existing_roster = await db.rosters.find_one({
-        "league_id": league_id, "user_id": winner_id
-    }, {"_id": 0})
-    if existing_roster:
-        already = any(e["player_id"] == player_id for e in existing_roster.get("entries", []))
-        if already:
-            raise HTTPException(400, "Giocatore già in rosa del vincitore")
-
-    # Deduct wallet
-    wallet = await db.wallets.find_one({"league_id": league_id, "user_id": winner_id})
-    if not wallet:
-        raise HTTPException(400, "Wallet del vincitore mancante")
-    if amount > wallet["remaining"]:
-        raise HTTPException(400, "Fantamilioni insufficienti del vincitore")
-    await db.wallets.update_one(
-        {"league_id": league_id, "user_id": winner_id},
-        {"$inc": {"spent": amount, "remaining": -amount}},
-    )
-    # Add to roster
-    await db.rosters.update_one(
-        {"league_id": league_id, "user_id": winner_id},
-        {"$push": {"entries": {"player_id": player_id, "price_paid": amount}}},
-        upsert=True,
-    )
-    # Mark auction as sold + reset
-    new_state = {
-        "league_id": league_id,
-        "active_player_id": None,
-        "current_bid": 1,
-        "current_bidder_id": None,
-        "current_bidder_name": None,
-        "status": "sold",
-    }
-    await db.auction_state.update_one({"league_id": league_id}, {"$set": new_state})
-    return AuctionState(**new_state)
+    st = await _perform_assign(league_id, st)
+    st = _state_with_countdown(st)
+    st["bid_countdown_seconds"] = AUCTION_COUNTDOWN_SECONDS
+    return AuctionState(**st)
 
 
 # ------------------------------------------------------------

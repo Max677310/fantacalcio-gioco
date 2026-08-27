@@ -94,6 +94,8 @@ export const api = {
   auctionBids: (leagueId: string) => request<any[]>(`/auction/${leagueId}/bids`),
   placeBid: (leagueId: string, amount: number) =>
     request<any>(`/auction/${leagueId}/bid`, { method: 'POST', body: JSON.stringify({ amount }) }),
+  passBid: (leagueId: string) =>
+    request<any>(`/auction/${leagueId}/pass`, { method: 'POST' }),
   nextPlayer: (leagueId: string, playerId: string) =>
     request<any>(`/auction/${leagueId}/next`, { method: 'POST', body: JSON.stringify({ player_id: playerId }) }),
   regulations: (leagueId: string) => request<any>(`/regulations/${leagueId}`),

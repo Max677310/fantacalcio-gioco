@@ -15,7 +15,17 @@ import { theme, roleLabels, roleColors } from '@/src/lib/theme';
 
 type Player = { id: string; name: string; team: string; role: string; price: number; avg_vote: number };
 type Bid = { id: string; user_id: string; user_name: string; amount: number; created_at: string; player_id: string };
-type State = { active_player_id: string; current_bid: number; current_bidder_id: string | null; current_bidder_name: string | null; status: string };
+type State = {
+  active_player_id: string;
+  current_bid: number;
+  current_bidder_id: string | null;
+  current_bidder_name: string | null;
+  status: string;
+  bid_expires_at?: string | null;
+  passed_user_ids?: string[];
+  bid_countdown_seconds?: number;
+  seconds_remaining?: number | null;
+};
 
 const relTime = (iso: string) => {
   const diff = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -40,6 +50,8 @@ export default function Auction() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [wallet, setWallet] = useState<any>(null);
   const pollRef = useRef<any>(null);
+  const tickerRef = useRef<any>(null);
+  const [tickNow, setTickNow] = useState<number>(Date.now());
 
   const load = useCallback(async () => {
     if (!league) return;
@@ -60,15 +72,46 @@ export default function Auction() {
 
   useEffect(() => {
     load();
-    pollRef.current = setInterval(load, 4000);
-    return () => clearInterval(pollRef.current);
-  }, [load]);
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+      if (tickerRef.current) clearInterval(tickerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league?.id]);
+
+  // Adaptive polling: 1.5s when timer running, 4s otherwise
+  useEffect(() => {
+    if (pollRef.current) clearInterval(pollRef.current);
+    const timerActive = state?.status === 'running' && !!state?.bid_expires_at;
+    const period = timerActive ? 1500 : 4000;
+    pollRef.current = setInterval(load, period);
+    return () => { if (pollRef.current) clearInterval(pollRef.current); };
+  }, [state?.status, state?.bid_expires_at, load]);
+
+  // Client-side ticker (200ms) for smooth countdown UI
+  useEffect(() => {
+    if (tickerRef.current) clearInterval(tickerRef.current);
+    if (state?.bid_expires_at) {
+      tickerRef.current = setInterval(() => setTickNow(Date.now()), 200);
+    }
+    return () => { if (tickerRef.current) clearInterval(tickerRef.current); };
+  }, [state?.bid_expires_at]);
 
   const doBid = async (amount: number) => {
     if (!league || !state) return;
     setBusy(true); setErrorMsg(null);
     try {
       await api.placeBid(league.id, amount);
+      await load();
+    } catch (e: any) { setErrorMsg(e.message); }
+    finally { setBusy(false); }
+  };
+
+  const doPass = async () => {
+    if (!league || !state) return;
+    setBusy(true); setErrorMsg(null);
+    try {
+      await api.passBid(league.id);
       await load();
     } catch (e: any) { setErrorMsg(e.message); }
     finally { setBusy(false); }
@@ -99,6 +142,24 @@ export default function Auction() {
 
   const roleTint = roleColors[player.role] || theme.colors.brandPrimary;
   const isCurrentBidder = state.current_bidder_id === user?.id;
+  const isSold = state.status === 'sold';
+  const isAdmin = league?.admin_id === user?.id;
+  const totalSecs = state.bid_countdown_seconds || 15;
+
+  // Client-side countdown (uses server-provided expiry timestamp)
+  let secondsLeft: number | null = null;
+  if (state.bid_expires_at) {
+    const target = new Date(state.bid_expires_at).getTime();
+    secondsLeft = Math.max(0, (target - tickNow) / 1000);
+  }
+  const timerActive = !!state.bid_expires_at && state.status === 'running' && (secondsLeft ?? 0) > 0;
+  const timerExpired = !!state.bid_expires_at && (secondsLeft ?? 0) <= 0;
+  const hasPassed = !!(user?.id && state.passed_user_ids?.includes(user.id));
+  const canBid = !isSold && !timerExpired && !hasPassed;
+  const canPass = !isSold && timerActive && !isCurrentBidder && !hasPassed;
+  const timerColor =
+    (secondsLeft ?? 99) <= 5 ? theme.colors.error :
+    (secondsLeft ?? 99) <= 10 ? theme.colors.brandSecondary : theme.colors.success;
 
   return (
     <View style={styles.root} testID="auction-screen">
@@ -112,15 +173,55 @@ export default function Auction() {
           />
           <View style={styles.topContent}>
             <View style={styles.topHead}>
-              <View style={styles.livePill}>
-                <View style={styles.liveDot} />
-                <Text style={styles.livePillText}>ASTA LIVE</Text>
+              <View style={[styles.livePill, isSold && { backgroundColor: 'rgba(255,64,64,0.2)', borderColor: theme.colors.error }]}>
+                <View style={[styles.liveDot, isSold && { backgroundColor: theme.colors.error }]} />
+                <Text style={[styles.livePillText, isSold && { color: theme.colors.error }]}>
+                  {isSold ? 'VENDUTO' : 'ASTA LIVE'}
+                </Text>
               </View>
-              <Pressable onPress={() => openPicker(null)} style={styles.nextBtn} testID="next-player-button" hitSlop={6}>
-                <Ionicons name="shuffle" size={14} color={theme.colors.onSurface} />
-                <Text style={styles.nextBtnText}>Cambia</Text>
-              </Pressable>
+              {isAdmin && (
+                <Pressable onPress={() => openPicker(null)} style={styles.nextBtn} testID="next-player-button" hitSlop={6}>
+                  <Ionicons name="shuffle" size={14} color={theme.colors.onSurface} />
+                  <Text style={styles.nextBtnText}>{isSold ? 'Prossimo' : 'Cambia'}</Text>
+                </Pressable>
+              )}
             </View>
+
+            {/* Countdown or Sold banner */}
+            {isSold ? (
+              <View style={styles.soldBanner} testID="sold-banner">
+                <Ionicons name="trophy" size={20} color={theme.colors.brandSecondary} />
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.soldTitle} numberOfLines={1}>
+                    Aggiudicato a {state.current_bidder_name || '—'}
+                  </Text>
+                  <Text style={styles.soldSub}>per {state.current_bid} fantamilioni</Text>
+                </View>
+              </View>
+            ) : state.bid_expires_at ? (
+              <View style={styles.timerRow} testID="auction-timer">
+                <View style={styles.timerCircle}>
+                  <Text style={[styles.timerNumber, { color: timerColor }]} testID="timer-seconds">
+                    {Math.ceil(secondsLeft ?? 0)}
+                  </Text>
+                  <Text style={styles.timerLabel}>SEC</Text>
+                </View>
+                <View style={styles.timerBarWrap}>
+                  <View
+                    style={[
+                      styles.timerBar,
+                      {
+                        width: `${Math.max(0, Math.min(100, ((secondsLeft ?? 0) / totalSecs) * 100))}%`,
+                        backgroundColor: timerColor,
+                      },
+                    ]}
+                  />
+                  <Text style={styles.timerHint}>
+                    {timerExpired ? 'Tempo scaduto' : 'Rilancia prima che scada!'}
+                  </Text>
+                </View>
+              </View>
+            ) : null}
 
             <View style={styles.playerRow}>
               <View style={[styles.roleBadge, { backgroundColor: roleTint + '22', borderColor: roleTint + '55' }]}>
@@ -192,25 +293,35 @@ export default function Auction() {
         <BlurView intensity={40} tint="dark" style={styles.stickyBar}>
           <SafeAreaView edges={['bottom']}>
             {errorMsg && <Text style={styles.errorLine} testID="bid-error">{errorMsg}</Text>}
+            {hasPassed && !isSold && (
+              <View style={styles.passedNote} testID="passed-note">
+                <Ionicons name="hand-left" size={12} color={theme.colors.onSurfaceSecondary} />
+                <Text style={styles.passedNoteText}>Hai passato — attendi il prossimo giocatore</Text>
+              </View>
+            )}
             <View style={styles.ctrlRow}>
               <Pressable
                 testID="bid-plus-1"
-                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnSecondary, pressed && { opacity: 0.8 }]}
-                onPress={() => doBid(state.current_bid + 1)} disabled={busy}>
+                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnSecondary, pressed && { opacity: 0.8 }, (!canBid || busy) && styles.ctrlBtnDisabled]}
+                onPress={() => doBid(state.current_bid + 1)}
+                disabled={busy || !canBid}>
                 <Text style={styles.ctrlBtnTextSecondary}>+1</Text>
               </Pressable>
               <Pressable
                 testID="bid-custom"
-                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnPrimary, pressed && { opacity: 0.85 }]}
+                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnPrimary, pressed && { opacity: 0.85 }, (!canBid || busy) && styles.ctrlBtnDisabled]}
                 onPress={() => { setCustomAmount(String(state.current_bid + 5)); setCustomVisible(true); }}
-                disabled={busy}>
+                disabled={busy || !canBid}>
                 {busy ? <ActivityIndicator color={theme.colors.onBrandSecondary} />
-                      : <Text style={styles.ctrlBtnTextPrimary}>Rilancio custom</Text>}
+                      : <Text style={styles.ctrlBtnTextPrimary}>
+                          {isSold ? 'Venduto' : (hasPassed ? 'Passato' : 'Rilancio custom')}
+                        </Text>}
               </Pressable>
               <Pressable
                 testID="bid-pass"
-                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnGhost, pressed && { opacity: 0.7 }]}
-                onPress={() => setErrorMsg('Hai passato il turno')} disabled={busy}>
+                style={({ pressed }) => [styles.ctrlBtn, styles.ctrlBtnGhost, pressed && { opacity: 0.7 }, (!canPass || busy) && styles.ctrlBtnDisabled]}
+                onPress={doPass}
+                disabled={busy || !canPass}>
                 <Text style={styles.ctrlBtnTextGhost}>Passo</Text>
               </Pressable>
             </View>
@@ -308,8 +419,8 @@ const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.colors.surface },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
 
-  topSection: { height: 260, overflow: 'hidden', borderBottomWidth: 1, borderBottomColor: theme.colors.border },
-  topContent: { flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.sm, paddingBottom: theme.spacing.lg, justifyContent: 'space-between' },
+  topSection: { minHeight: 260, overflow: 'hidden', borderBottomWidth: 1, borderBottomColor: theme.colors.border },
+  topContent: { flex: 1, paddingHorizontal: theme.spacing.lg, paddingTop: theme.spacing.sm, paddingBottom: theme.spacing.md, gap: 10 },
   topHead: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   livePill: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: 'rgba(239,68,68,0.18)', paddingHorizontal: 10, paddingVertical: 5, borderRadius: theme.radius.pill, borderWidth: 1, borderColor: 'rgba(239,68,68,0.4)' },
   liveDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: theme.colors.error },
@@ -372,6 +483,51 @@ const styles = StyleSheet.create({
   ctrlBtnTextSecondary: { color: theme.colors.onSurface, fontWeight: '800', fontSize: 16 },
   ctrlBtnTextPrimary: { color: theme.colors.onBrandSecondary, fontWeight: '800', fontSize: 15 },
   ctrlBtnTextGhost: { color: theme.colors.onSurfaceSecondary, fontWeight: '700', fontSize: 14 },
+  ctrlBtnDisabled: { opacity: 0.35 },
+
+  // Timer + Sold banner
+  timerRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: 'rgba(0,0,0,0.55)',
+    borderRadius: theme.radius.md,
+    padding: 12,
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)',
+  },
+  timerCircle: {
+    width: 56, height: 56, borderRadius: 28,
+    backgroundColor: 'rgba(0,0,0,0.7)',
+    borderWidth: 2, borderColor: 'rgba(255,255,255,0.15)',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  timerNumber: { fontSize: 22, fontWeight: '800', lineHeight: 24 },
+  timerLabel: { color: theme.colors.onSurfaceSecondary, fontSize: 8, fontWeight: '700', letterSpacing: 1, marginTop: -2 },
+  timerBarWrap: {
+    flex: 1, height: 22, backgroundColor: 'rgba(255,255,255,0.08)',
+    borderRadius: 11, overflow: 'hidden', position: 'relative',
+    justifyContent: 'center',
+  },
+  timerBar: {
+    position: 'absolute', top: 0, left: 0, bottom: 0,
+    borderRadius: 11,
+  },
+  timerHint: {
+    color: theme.colors.onSurface, fontSize: 11, fontWeight: '700',
+    paddingHorizontal: 10, zIndex: 2,
+  },
+  soldBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: 12,
+    backgroundColor: 'rgba(212,175,55,0.15)',
+    borderRadius: theme.radius.md,
+    padding: 12,
+    borderWidth: 1, borderColor: theme.colors.brandSecondary,
+  },
+  soldTitle: { color: theme.colors.brandSecondary, fontSize: 14, fontWeight: '800' },
+  soldSub: { color: theme.colors.onSurfaceSecondary, fontSize: 12, marginTop: 2 },
+  passedNote: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6,
+    paddingTop: 8,
+  },
+  passedNoteText: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '600' },
 
   modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', alignItems: 'center', justifyContent: 'center', padding: 24 },
   modalCard: { width: '100%', maxWidth: 400, backgroundColor: theme.colors.surfaceSecondary, borderRadius: theme.radius.lg, padding: theme.spacing.lg, borderWidth: 1, borderColor: theme.colors.border },
