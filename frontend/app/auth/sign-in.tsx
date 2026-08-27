@@ -104,6 +104,15 @@ export default function SignIn() {
                   : <Text style={styles.ctaText}>Entra nella lega</Text>}
               </Pressable>
 
+              <Pressable
+                testID="forgot-password-link"
+                onPress={() => router.push('/auth/forgot-password')}
+                hitSlop={8}
+                style={styles.forgotWrap}
+              >
+                <Text style={styles.forgotLink}>Password dimenticata?</Text>
+              </Pressable>
+
               <View style={styles.demoHint}>
                 <Text style={styles.demoText}>Demo: demo@fanta.it · demo1234</Text>
               </View>
@@ -169,6 +178,8 @@ const styles = StyleSheet.create({
   ctaText: { color: theme.colors.onBrandSecondary, fontSize: 16, fontWeight: '800', letterSpacing: 0.3 },
   demoHint: { marginTop: 12, alignItems: 'center' },
   demoText: { color: theme.colors.onSurfaceSecondary, fontSize: 12 },
+  forgotWrap: { alignItems: 'center', marginTop: 10 },
+  forgotLink: { color: theme.colors.brandSecondary, fontSize: 13, fontWeight: '700' },
   footerRow: { flexDirection: 'row', justifyContent: 'center', gap: 6, marginTop: theme.spacing.md },
   footerLabel: { color: theme.colors.onSurfaceSecondary, fontSize: 14 },
   footerLink: { color: theme.colors.brandPrimary, fontSize: 14, fontWeight: '700' },

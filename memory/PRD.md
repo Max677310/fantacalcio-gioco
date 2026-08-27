@@ -50,7 +50,13 @@ Cross-platform Expo React Native mobile app for **Italian Fantasy Football (Fant
 - Automated Monday API (manual admin upload / smart mock ratings + auto bench subs)
 
 ## Recently completed
-- **Timer Asta 15s + Passo** (v10): each new bid restarts a 15-second countdown; when it expires the player is auto-assigned to the highest bidder. New endpoint `POST /api/auction/{id}/pass` — non-bidders can withdraw; if everyone else passes the player is auto-assigned immediately. Frontend shows live countdown (green→gold→red), "Passo" button (disabled for current bidder), and "VENDUTO" banner after auto-assign.
+- **S.V. + Voto d'Ufficio, Statistiche Giocatore, Recupero Password** (v11):
+  - Backend: `compute_fantavoto` ora supporta `base_vote=None` (S.V.). Regole d'ufficio: rosso→base 4; gol/assist/rigore/autogol→base 6; S.V. senza eventi→sostituzione dalla panchina. Persistenza campi `sv` + `effective_base` nella collection `player_ratings`.
+  - Nuovo endpoint `GET /api/players/{id}/stats?league_id=` che aggrega per-giornata da `player_ratings`: matches_played, matches_sv, total_goals/assists/yellows/reds/own_goals/penalties, avg_vote, fantamedia, per_matchday timeline.
+  - Frontend: nuova rotta dinamica `/app/player/[id].tsx` con card quotazione+media, 6 metric cards, dettaglio giornate. Aperta cliccando sui nomi in Mercato (rosa+free agent) e sui chip nella Formazione.
+  - **Password Recovery** via Emergent Resend: `POST /api/auth/forgot-password` genera codice 6 cifre valido 15 min, invia email HTML italiana (template inline gold/dark) rispettando i guardrail (no impersonation, no credential harvest, https-only, structural gate `_assert_safe_email`). `POST /api/auth/reset-password` verifica codice (bcrypt-hashed, max 5 tentativi, uso singolo) e ruota la password. Rate-limit 3 codici/ora per email. Rispose silenziose per email sconosciute (anti-enumeration).
+  - Frontend auth: link "Password dimenticata?" in `sign-in.tsx`, 2 nuove schermate `auth/forgot-password.tsx` (email input + success card) e `auth/reset-password.tsx` (email prefill + codice grande + doppia password).
+- **Timer Asta 15s + Passo** (v10): each new bid restarts a 15-second countdown; when it expires the player is auto-assigned to the highest bidder. New endpoint `POST /api/auction/{id}/pass`. Frontend shows live countdown (green→gold→red), "Passo" button (disabled for current bidder), and "VENDUTO" banner.
 - **Giornata di partenza personalizzata** (v8): admin can pick which Serie A matchday (1-38) the league starts tracking from. Fixtures are numbered accordingly. Editable pre-kickoff via `PATCH /api/leagues/{id}/settings`.
 - **Motore Fantavoto + Chiusura Giornata** (v9):
   - `POST /api/leagues/{id}/matchday/{n}/ratings/manual` – admin uploads JSON list of `PlayerRatingIn` records

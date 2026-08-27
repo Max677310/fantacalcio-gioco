@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { View, Text, StyleSheet, ScrollView, Pressable } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { useRouter } from 'expo-router';
 import { Ionicons } from '@expo/vector-icons';
 import { api } from '@/src/lib/api';
 import { theme, roleColors } from '@/src/lib/theme';
@@ -68,6 +69,7 @@ const FORMATIONS: Record<string, Slot[]> = {
 const FORMATION_KEYS = ['4-3-3', '3-4-3', '3-5-2', '4-4-2', '4-5-1', '5-3-2', '5-4-1'] as const;
 
 export default function Lineup() {
+  const router = useRouter();
   const [formation, setFormation] = useState<string>('4-3-3');
   const [players, setPlayers] = useState<Record<SlotRole, P[]>>({ P: [], D: [], C: [], A: [] });
 
@@ -145,10 +147,11 @@ export default function Lineup() {
           {chosen.map(({ slot, player }, i) => {
             const tint = roleColors[slot.role];
             return (
-              <View
+              <Pressable
                 key={`${formation}-${i}`}
                 testID={`lineup-slot-${i}`}
-                style={[
+                onPress={() => player && router.push(`/player/${player.id}`)}
+                style={({ pressed }) => [
                   styles.chipPlayer,
                   {
                     top: `${slot.top}%`,
@@ -156,7 +159,9 @@ export default function Lineup() {
                     borderColor: tint + '99',
                     transform: [{ translateX: -32 }],
                   },
+                  pressed && player && { opacity: 0.7 },
                 ]}
+                disabled={!player}
               >
                 <View style={[styles.chipDot, { backgroundColor: tint }]}>
                   <Text style={styles.chipDotText}>{slot.role}</Text>
@@ -164,7 +169,7 @@ export default function Lineup() {
                 <Text style={styles.chipName} numberOfLines={1}>
                   {player ? player.name.split(' ').slice(-1)[0] : '—'}
                 </Text>
-              </View>
+              </Pressable>
             );
           })}
         </View>

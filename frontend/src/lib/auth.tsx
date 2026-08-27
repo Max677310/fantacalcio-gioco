@@ -10,6 +10,7 @@ interface AuthCtx {
   login: (email: string, password: string) => Promise<void>;
   register: (payload: import('./api').RegisterPayload) => Promise<void>;
   logout: () => Promise<void>;
+  hydrateFromToken: (accessToken: string, user: any) => Promise<void>;
 }
 
 const Ctx = createContext<AuthCtx>({} as any);
@@ -58,7 +59,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUserState(null);
   }, []);
 
-  return <Ctx.Provider value={{ user, loading, login, register, logout }}>{children}</Ctx.Provider>;
+  const hydrateFromToken = useCallback(async (accessToken: string, u: any) => {
+    await setToken(accessToken);
+    await setUser(u);
+    setUserState(u);
+  }, []);
+
+  return <Ctx.Provider value={{ user, loading, login, register, logout, hydrateFromToken }}>{children}</Ctx.Provider>;
 }
 
 export const useAuth = () => useContext(Ctx);

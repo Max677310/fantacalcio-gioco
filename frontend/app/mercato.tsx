@@ -213,10 +213,15 @@ export default function Mercato() {
                 <View style={[styles.roleTag, { backgroundColor: tint + '22', borderColor: tint + '55' }]}>
                   <Text style={[styles.roleTagText, { color: tint }]}>{p.role}</Text>
                 </View>
-                <View style={{ flex: 1 }}>
+                <Pressable
+                  style={{ flex: 1 }}
+                  onPress={() => router.push(`/player/${p.id}`)}
+                  testID={`player-info-${p.id}`}
+                  hitSlop={4}
+                >
                   <Text style={styles.cardName}>{p.name}</Text>
                   <Text style={styles.cardMeta}>{p.team} · Comprato a {e.price_paid}</Text>
-                </View>
+                </Pressable>
                 {isOpen ? (
                   <Pressable
                     testID={`release-${p.id}`}
@@ -246,10 +251,15 @@ export default function Mercato() {
                 <View style={[styles.roleTag, { backgroundColor: tint + '22', borderColor: tint + '55' }]}>
                   <Text style={[styles.roleTagText, { color: tint }]}>{p.role}</Text>
                 </View>
-                <View style={{ flex: 1 }}>
+                <Pressable
+                  style={{ flex: 1 }}
+                  onPress={() => router.push(`/player/${p.id}`)}
+                  testID={`free-agent-info-${p.id}`}
+                  hitSlop={4}
+                >
                   <Text style={styles.cardName}>{p.name}</Text>
                   <Text style={styles.cardMeta}>{p.team} · {roleLabels[p.role]}</Text>
-                </View>
+                </Pressable>
                 {isOpen ? (
                   <Pressable
                     testID={`buy-${p.id}`}

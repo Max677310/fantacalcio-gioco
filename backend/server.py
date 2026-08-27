@@ -10,6 +10,11 @@ import jwt
 import random
 import re
 import string
+import ipaddress
+import httpx
+from html import escape
+from html.parser import HTMLParser
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from pydantic import BaseModel, EmailStr, Field
@@ -38,6 +43,116 @@ db = client[DB_NAME]
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2 = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
+# ------------------------------------------------------------
+# Email (Emergent managed) — password reset
+# ------------------------------------------------------------
+EMAIL_BASE_URL = "https://integrations.emergentagent.com"
+EMAIL_KEY = os.environ.get("EMERGENT_EMAIL_KEY")
+EMAIL_FROM_NAME = os.environ.get("EMAIL_FROM_NAME") or "Fantacalcio Manager"
+EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
+_APP_HOST = os.environ.get("APP_PUBLIC_URL") or "https://fantacalcio.app"
+
+_SHORTENERS = ("bit.ly", "tinyurl.com", "t.co", "is.gd", "cutt.ly", "goo.gl", "rebrand.ly")
+_CRED_ASK = (
+    "reply with your password", "reply with the code", "send your password", "cvv",
+    "send us your password", "enter your password below", "confirm your card number",
+    "your full card number", "seed phrase", "recovery phrase", "verify your card",
+    "social security number", "confirm your bank details",
+)
+_HOSTISH = re.compile(r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})", re.I)
+
+
+def _host_ok(host: str) -> bool:
+    if not host or "xn--" in host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return not any(host == s or host.endswith("." + s) for s in _SHORTENERS)
+
+
+def _same_site(shown: str, real: str) -> bool:
+    return shown == real or real.endswith("." + shown) or shown.endswith("." + real)
+
+
+class _EmailScan(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tags, self.urls, self.anchors = set(), [], []
+        self._href, self._text = None, []
+    def handle_starttag(self, tag, attrs):
+        self.tags.add(tag.lower())
+        self.urls += [v for k, v in attrs if k.lower() in ("href", "src") and v]
+        if tag.lower() == "a":
+            self._href = dict((k.lower(), v) for k, v in attrs).get("href")
+            self._text = []
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            self.anchors.append((self._href, "".join(self._text)))
+            self._href, self._text = None, []
+
+
+def _assert_safe_email(subject: str, html: str) -> None:
+    scan = _EmailScan(); scan.feed(html)
+    if scan.tags & {"form", "input", "textarea", "select"}:
+        raise ValueError("No forms or input fields in email (G2)")
+    body = f"{subject}\n{html}".lower()
+    for p in _CRED_ASK:
+        if p in body:
+            raise ValueError(f"Email asks for credentials: {p!r} (G2)")
+    for url in scan.urls:
+        low = url.strip().lower()
+        if low.startswith(("mailto:", "tel:", "cid:", "#")):
+            continue
+        if not low.startswith("https://"):
+            raise ValueError(f"Email links must be absolute https: {url!r} (G3)")
+        host = urlparse(low).hostname or ""
+        if not _host_ok(host) or urlparse(low).username is not None:
+            raise ValueError(f"Shortened/numeric/credential URL: {url!r} (G3)")
+    for href, text in scan.anchors:
+        real = urlparse(href.strip().lower()).hostname or ""
+        if not real:
+            continue
+        for m in _HOSTISH.finditer(text):
+            if not _same_site(m.group(1).lower(), real):
+                raise ValueError(f"Anchor text {m.group(1)!r} ≠ real host {real!r} (G3)")
+
+
+async def send_email(*, to: str, subject: str, html: str) -> Optional[str]:
+    """Send an email via Emergent managed integration. Server-side templates only."""
+    _assert_safe_email(subject, html)
+    if not EMAIL_KEY:
+        logging.getLogger("fantacalcio").warning("EMERGENT_EMAIL_KEY missing; email not sent")
+        return None
+    payload = {
+        "to": [to], "subject": subject, "html": html,
+        "from_name": EMAIL_FROM_NAME,
+    }
+    if EMAIL_REPLY_TO:
+        payload["contact_email"] = EMAIL_REPLY_TO
+    try:
+        async with httpx.AsyncClient(timeout=30) as client_http:
+            resp = await client_http.post(
+                f"{EMAIL_BASE_URL}/api/v1/email/send",
+                headers={"X-Email-Key": EMAIL_KEY},
+                json=payload,
+            )
+        resp.raise_for_status()
+        return resp.json().get("id")
+    except httpx.HTTPStatusError as e:
+        logging.getLogger("fantacalcio").error(
+            "Email send failed: %s %s", e.response.status_code, e.response.text
+        )
+        raise HTTPException(status_code=502, detail="Errore invio email")
+    except Exception as e:
+        logging.getLogger("fantacalcio").error("Email send error: %s", e)
+        raise HTTPException(status_code=500, detail="Errore invio email")
 
 app = FastAPI(title="Fantacalcio API")
 api = APIRouter(prefix="/api")
@@ -487,6 +602,139 @@ async def login(data: UserLogin):
 async def me(current=Depends(get_current_user)):
     return User(id=current["id"], email=current["email"], name=current["name"])
 
+
+# ------------------------------------------------------------
+# Password reset — Emergent managed email
+# ------------------------------------------------------------
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=6, pattern=r"^[0-9]{6}$")
+    new_password: str = Field(min_length=6, max_length=128)
+
+
+RESET_CODE_TTL_MIN = 15
+RESET_MAX_PER_HOUR = 3
+RESET_MAX_ATTEMPTS = 5
+
+
+def _reset_email_html(name: str, code: str) -> str:
+    return (
+        f'<table role="presentation" width="100%" style="background:#0D0F12;padding:32px 0">'
+        f'<tr><td align="center">'
+        f'<table role="presentation" width="480" style="background:#1A1D24;border-radius:12px;'
+        f'padding:32px;font-family:Arial,Helvetica,sans-serif;color:#F5F5F5">'
+        f'<tr><td>'
+        f'<h1 style="margin:0 0 16px;color:#D4AF37;font-size:22px">Reimposta la tua password</h1>'
+        f'<p style="margin:0 0 16px;color:#F5F5F5;font-size:14px;line-height:22px">'
+        f'Ciao {escape(name)},<br>hai richiesto di reimpostare la password del tuo account '
+        f'{escape(EMAIL_FROM_NAME)}.'
+        f'</p>'
+        f'<p style="margin:0 0 8px;color:#B0B6C0;font-size:13px">Inserisci questo codice nell\'app '
+        f'entro {RESET_CODE_TTL_MIN} minuti:</p>'
+        f'<div style="background:#0D0F12;border:1px solid #2A2E39;border-radius:8px;padding:20px;'
+        f'text-align:center;margin:12px 0 24px">'
+        f'<div style="font-family:Menlo,Consolas,monospace;color:#D4AF37;font-size:36px;'
+        f'letter-spacing:12px;font-weight:800">{code}</div>'
+        f'</div>'
+        f'<p style="margin:0 0 8px;color:#B0B6C0;font-size:12px;line-height:18px">'
+        f'Se non hai richiesto tu la reimpostazione, puoi ignorare questa email. '
+        f'La tua password rimarrà invariata.'
+        f'</p>'
+        f'<hr style="border:none;border-top:1px solid #2A2E39;margin:24px 0">'
+        f'<p style="margin:0;color:#7A7F8A;font-size:11px;line-height:16px">'
+        f'Inviata da {escape(EMAIL_FROM_NAME)}. Non chiediamo mai la tua password o codici via email; '
+        f'usa questo codice solo direttamente nell\'app.'
+        f'</p>'
+        f'</td></tr>'
+        f'</table></td></tr></table>'
+    )
+
+
+@api.post("/auth/forgot-password")
+async def forgot_password(data: ForgotPasswordRequest):
+    """Send a 6-digit reset code by email. Silent success even if the email is unknown
+    to avoid leaking existing accounts."""
+    email = data.email.lower().strip()
+
+    # Rate limit: max RESET_MAX_PER_HOUR new codes for this email in the last hour
+    one_hour_ago = datetime.now(timezone.utc) - timedelta(hours=1)
+    recent = await db.password_resets.count_documents({
+        "email": email,
+        "created_at": {"$gte": one_hour_ago.isoformat()},
+    })
+    if recent >= RESET_MAX_PER_HOUR:
+        # silently succeed to not reveal state; but no email is sent
+        return {"sent": False, "detail": "Troppe richieste, riprova più tardi"}
+
+    user = await db.users.find_one({"email": email})
+    if not user:
+        # do NOT reveal user does not exist
+        return {"sent": True}
+
+    code = f"{random.SystemRandom().randint(0, 999999):06d}"
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=RESET_CODE_TTL_MIN)
+    # Invalidate previous unused codes for this email
+    await db.password_resets.update_many(
+        {"email": email, "used": False},
+        {"$set": {"used": True, "invalidated_at": now.isoformat()}},
+    )
+    await db.password_resets.insert_one({
+        "id": str(uuid.uuid4()),
+        "email": email,
+        "user_id": user["id"],
+        "code_hash": pwd_ctx.hash(code),
+        "attempts": 0,
+        "used": False,
+        "created_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+    })
+    await send_email(
+        to=user["email"],
+        subject=f"Codice di reimpostazione — {EMAIL_FROM_NAME}",
+        html=_reset_email_html(user.get("name") or "Manager", code),
+    )
+    return {"sent": True}
+
+
+@api.post("/auth/reset-password", response_model=Token)
+async def reset_password(data: ResetPasswordRequest):
+    email = data.email.lower().strip()
+    now = datetime.now(timezone.utc)
+    # find latest unused non-expired code for this email
+    doc = await db.password_resets.find_one(
+        {"email": email, "used": False, "expires_at": {"$gte": now.isoformat()}},
+        sort=[("created_at", -1)],
+    )
+    if not doc:
+        raise HTTPException(400, "Codice non valido o scaduto")
+    if int(doc.get("attempts", 0)) >= RESET_MAX_ATTEMPTS:
+        raise HTTPException(400, "Troppi tentativi. Richiedi un nuovo codice.")
+    if not pwd_ctx.verify(data.code, doc["code_hash"]):
+        await db.password_resets.update_one(
+            {"id": doc["id"]}, {"$inc": {"attempts": 1}}
+        )
+        raise HTTPException(400, "Codice non valido o scaduto")
+    user = await db.users.find_one({"id": doc["user_id"]})
+    if not user:
+        raise HTTPException(400, "Utente non trovato")
+    # rotate password
+    await db.users.update_one(
+        {"id": user["id"]},
+        {"$set": {"password_hash": pwd_ctx.hash(data.new_password)}},
+    )
+    await db.password_resets.update_one(
+        {"id": doc["id"]}, {"$set": {"used": True, "used_at": now.isoformat()}}
+    )
+    return Token(
+        access_token=make_token(user["id"]),
+        user=User(id=user["id"], email=user["email"], name=user["name"]),
+    )
+
 # ------------------------------------------------------------
 # League routes
 # ------------------------------------------------------------
@@ -562,6 +810,114 @@ async def get_player(player_id: str):
     if not p:
         raise HTTPException(404, "Giocatore non trovato")
     return Player(**p)
+
+
+class PlayerStats(BaseModel):
+    player_id: str
+    player_name: str
+    role: Role
+    team: str
+    price: int
+    listino_avg_vote: float
+    listino_fantavoto: Optional[float] = None
+    league_id: Optional[str] = None
+    matches_played: int = 0
+    matches_sv: int = 0
+    total_goals: int = 0
+    total_assists: int = 0
+    total_yellows: int = 0
+    total_reds: int = 0
+    total_own_goals: int = 0
+    total_penalties_saved: int = 0
+    total_penalties_missed: int = 0
+    avg_vote: Optional[float] = None
+    fantamedia: Optional[float] = None
+    per_matchday: List[dict] = []
+
+
+@api.get("/players/{player_id}/stats", response_model=PlayerStats)
+async def get_player_stats(
+    player_id: str,
+    league_id: Optional[str] = None,
+    current=Depends(get_current_user),
+):
+    """Aggregate per-matchday ratings into a summary for the player detail screen.
+    If league_id is provided, only ratings from that league are included; otherwise
+    the response falls back to the player's baseline listino stats.
+    """
+    p = await db.players.find_one({"id": player_id}, {"_id": 0})
+    if not p:
+        raise HTTPException(404, "Giocatore non trovato")
+
+    stats = PlayerStats(
+        player_id=p["id"],
+        player_name=p["name"],
+        role=p["role"],
+        team=p["team"],
+        price=int(p.get("price") or 1),
+        listino_avg_vote=float(p.get("avg_vote") or 6.0),
+        listino_fantavoto=float(p.get("fantavoto")) if p.get("fantavoto") is not None else None,
+        league_id=league_id,
+    )
+
+    if league_id:
+        await require_membership(league_id, current)
+        cursor = db.player_ratings.find(
+            {"league_id": league_id, "player_id": player_id},
+            {"_id": 0},
+        ).sort("matchday", 1)
+        rows = await cursor.to_list(50)
+        vote_sum = 0.0
+        vote_count = 0
+        fv_sum = 0.0
+        fv_count = 0
+        per_matchday = []
+        for r in rows:
+            eff = r.get("effective_base")
+            if eff is None:
+                # backward compat: if we don't have effective_base, use base_vote
+                eff = r.get("base_vote")
+            if not r.get("played", True):
+                per_matchday.append({
+                    "matchday": r["matchday"], "played": False, "sv": bool(r.get("sv")),
+                    "base_vote": None, "fantavoto": None,
+                    "goals": 0, "assists": 0, "yellow": 0, "red": 0,
+                })
+                continue
+            stats.matches_played += 1
+            if r.get("sv") and eff is None:
+                stats.matches_sv += 1
+            if eff is not None:
+                vote_sum += float(eff); vote_count += 1
+                fv_sum += float(r.get("fantavoto") or 0.0); fv_count += 1
+            stats.total_goals += int(r.get("goals") or 0)
+            stats.total_assists += int(r.get("assists") or 0)
+            stats.total_yellows += int(r.get("yellow") or 0)
+            stats.total_reds += int(r.get("red") or 0)
+            stats.total_own_goals += int(r.get("own_goal") or 0)
+            stats.total_penalties_saved += int(r.get("penalty_saved") or 0)
+            stats.total_penalties_missed += int(r.get("penalty_missed") or 0)
+            per_matchday.append({
+                "matchday": r["matchday"],
+                "played": True,
+                "sv": bool(r.get("sv")),
+                "base_vote": eff,
+                "fantavoto": r.get("fantavoto"),
+                "goals": int(r.get("goals") or 0),
+                "assists": int(r.get("assists") or 0),
+                "yellow": int(r.get("yellow") or 0),
+                "red": int(r.get("red") or 0),
+            })
+        if vote_count:
+            stats.avg_vote = round(vote_sum / vote_count, 2)
+        if fv_count:
+            stats.fantamedia = round(fv_sum / fv_count, 2)
+        stats.per_matchday = per_matchday
+    else:
+        stats.avg_vote = stats.listino_avg_vote
+        stats.fantamedia = stats.listino_fantavoto
+    return stats
+
 
 # ------------------------------------------------------------
 # Auction routes
@@ -1215,7 +1571,8 @@ OWN_GOAL_BONUS = -2.0
 
 class PlayerRatingIn(BaseModel):
     player_id: str
-    base_vote: float = Field(ge=0, le=10)
+    # None means "Senza Voto" (S.V.) — engine assigns a d'ufficio base if there are events
+    base_vote: Optional[float] = Field(default=None, ge=0, le=10)
     goals: int = 0
     assists: int = 0
     yellow: int = 0
@@ -1233,7 +1590,7 @@ class PlayerRating(BaseModel):
     player_name: str
     role: Role
     team: str
-    base_vote: float
+    base_vote: Optional[float] = None  # None == S.V.
     goals: int = 0
     assists: int = 0
     yellow: int = 0
@@ -1243,6 +1600,8 @@ class PlayerRating(BaseModel):
     penalty_missed: int = 0
     played: bool = True
     fantavoto: float = 0.0
+    sv: bool = False  # true when base_vote was S.V.
+    effective_base: Optional[float] = None  # what was actually used (after d'ufficio rules)
 
 
 class MockRatingsBody(BaseModel):
@@ -1268,11 +1627,40 @@ class SettleReport(BaseModel):
     scores: List[ManagerScore]
 
 
-def compute_fantavoto(rating: dict, role: str, regs: dict) -> float:
-    """Apply regulations bonus/malus to a single player rating."""
+def _resolve_base_vote(rating: dict) -> Optional[float]:
+    """Apply Voto d'Ufficio rules for S.V. (Senza Voto) ratings.
+    Returns the effective base_vote to use, or None if the player should be
+    treated as 'did not play' (S.V. with no bonus/malus events → bench substitution).
+    """
+    base = rating.get("base_vote")
+    is_sv = base is None
+    if not is_sv:
+        return float(base)
+    # S.V. → look for meaningful events
+    red = int(rating.get("red") or 0)
+    goals = int(rating.get("goals") or 0)
+    assists = int(rating.get("assists") or 0)
+    pen_saved = int(rating.get("penalty_saved") or 0)
+    pen_missed = int(rating.get("penalty_missed") or 0)
+    own_goal = int(rating.get("own_goal") or 0)
+    if red > 0:
+        return 4.0  # espulsione → voto d'ufficio 4
+    if goals > 0 or assists > 0 or pen_saved > 0 or pen_missed > 0 or own_goal > 0:
+        return 6.0  # gol/assist/rigore/autogol → voto d'ufficio 6
+    return None  # no events → trigger bench substitution
+
+
+def compute_fantavoto(rating: dict, role: str, regs: dict) -> Optional[float]:
+    """Apply regulations bonus/malus to a single player rating.
+    Returns None when the player must be substituted from the bench
+    (either 'not played' or S.V. without meaningful events).
+    """
     if not rating.get("played", True):
-        return 0.0
-    fv = float(rating.get("base_vote") or 0.0)
+        return None
+    base = _resolve_base_vote(rating)
+    if base is None:
+        return None  # S.V. senza eventi → panchina
+    fv = float(base)
     goals = int(rating.get("goals") or 0)
     assists = int(rating.get("assists") or 0)
     yellow = int(rating.get("yellow") or 0)
@@ -1287,7 +1675,6 @@ def compute_fantavoto(rating: dict, role: str, regs: dict) -> float:
         fv += goals * float(regs.get("goal_bonus_c", 3.5))
     elif role == "D":
         fv += goals * float(regs.get("goal_bonus_d", 4.0))
-    # Goalkeeper goals are extremely rare, no default bonus
 
     fv += assists * float(regs.get("assist_bonus", 1.0))
     fv += yellow * float(regs.get("yellow_card", -0.5))
@@ -1383,27 +1770,31 @@ def _apply_bench_subs(
     bench_used_ids: List[str] = []
     for st in starters:
         r = ratings_map.get(st["id"])
-        if r and r.get("played", True):
-            fv = compute_fantavoto(r, st["role"], regs)
+        fv = compute_fantavoto(r, st["role"], regs) if r else None
+        if fv is not None:
             result.append({
                 "player_id": st["id"], "name": st["name"], "role": st["role"],
                 "fantavoto": fv, "from_bench": False,
             })
             continue
-        # try substitute from bench (same role) that HAS a rating and played
+        # try substitute from bench (same role) with a valid computed fantavoto
         sub = None
+        sub_fv = None
         pool = bench_by_role.get(st["role"], [])
         for cand in pool:
             cr = ratings_map.get(cand["id"])
-            if cr and cr.get("played", True):
+            if not cr:
+                continue
+            cfv = compute_fantavoto(cr, cand["role"], regs)
+            if cfv is not None:
                 sub = cand
+                sub_fv = cfv
                 break
         if sub is not None:
             pool.remove(sub)
-            fv = compute_fantavoto(ratings_map[sub["id"]], sub["role"], regs)
             result.append({
                 "player_id": sub["id"], "name": sub["name"], "role": sub["role"],
-                "fantavoto": fv, "from_bench": True,
+                "fantavoto": sub_fv, "from_bench": True,
             })
             bench_used_ids.append(sub["id"])
         else:
@@ -1464,7 +1855,10 @@ async def upload_ratings_manual(
             "role": p["role"],
             "team": p["team"],
         })
-        d["fantavoto"] = compute_fantavoto(d, p["role"], regs)
+        d["sv"] = d.get("base_vote") is None
+        d["effective_base"] = _resolve_base_vote(d)
+        fv = compute_fantavoto(d, p["role"], regs)
+        d["fantavoto"] = fv if fv is not None else 0.0
         docs.append(d)
     await db.player_ratings.insert_many(docs)
     return {"inserted": len(docs), "matchday": matchday, "source": "manual"}
@@ -1500,9 +1894,13 @@ async def generate_mock_ratings(
     for p in players:
         base_center = float(p.get("avg_vote") or 6.0)
         # base_vote sampled around avg with variance driven by `chaos`
-        base_vote = base_center + rng.uniform(-1.0, 1.0) * (0.4 + chaos * 0.8)
-        base_vote = max(3.0, min(9.5, round(base_vote, 1)))
+        base_vote_num = base_center + rng.uniform(-1.0, 1.0) * (0.4 + chaos * 0.8)
+        base_vote_num = max(3.0, min(9.5, round(base_vote_num, 1)))
         played = rng.random() > (0.05 + chaos * 0.10)  # 85-95% chance of playing
+
+        # ~7-10% of players who played receive S.V. (Senza Voto)
+        is_sv = played and rng.random() < (0.05 + chaos * 0.05)
+        base_vote: Optional[float] = None if is_sv else base_vote_num
 
         goals = 0
         assists = 0
@@ -1559,8 +1957,11 @@ async def generate_mock_ratings(
             "penalty_saved": pen_saved,
             "penalty_missed": pen_missed,
             "played": played,
+            "sv": is_sv,
         }
-        d["fantavoto"] = compute_fantavoto(d, p["role"], regs)
+        d["effective_base"] = _resolve_base_vote(d)
+        fv = compute_fantavoto(d, p["role"], regs)
+        d["fantavoto"] = fv if fv is not None else 0.0
         docs.append(d)
 
     if docs:

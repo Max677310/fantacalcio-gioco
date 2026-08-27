@@ -41,6 +41,10 @@ export const api = {
   login: (email: string, password: string) =>
     request<any>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }, false),
   me: () => request<any>('/auth/me'),
+  forgotPassword: (email: string) =>
+    request<any>('/auth/forgot-password', { method: 'POST', body: JSON.stringify({ email }) }),
+  resetPassword: (email: string, code: string, new_password: string) =>
+    request<any>('/auth/reset-password', { method: 'POST', body: JSON.stringify({ email, code, new_password }) }),
   myLeagues: () => request<any[]>('/leagues/mine'),
   createLeague: (name: string, team_name: string, mode: 'asta' | 'listino' = 'asta', start_matchday: number = 1) =>
     request<any>('/leagues/create', { method: 'POST', body: JSON.stringify({ name, team_name, mode, start_matchday }) }),
@@ -90,6 +94,8 @@ export const api = {
     return request<any[]>(`/players${qs ? '?' + qs : ''}`);
   },
   player: (id: string) => request<any>(`/players/${id}`),
+  playerStats: (id: string, leagueId?: string) =>
+    request<any>(`/players/${id}/stats${leagueId ? `?league_id=${leagueId}` : ''}`),
   auctionState: (leagueId: string) => request<any>(`/auction/${leagueId}/state`),
   auctionBids: (leagueId: string) => request<any[]>(`/auction/${leagueId}/bids`),
   placeBid: (leagueId: string, amount: number) =>
