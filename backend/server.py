@@ -2571,6 +2571,31 @@ async def on_stop():
 async def root():
     return {"message": "Fantacalcio API", "status": "ok"}
 
+
+# ------------------------------------------------------------
+# One-shot source-code export endpoint (self-hosting migration)
+# Token-gated download of the pre-built ZIP. Remove after use.
+# ------------------------------------------------------------
+_EXPORT_TOKEN = "jUkNl7GI3esnJRL2J-gOdmKfaCkj896X"
+_EXPORT_ZIP_PATH = Path("/app/backend/exports/fantacalcio-source.zip")
+
+
+@api.get("/export/source")
+async def download_source(token: str):
+    """Download the project ZIP for self-hosting migration.
+    Usage: /api/export/source?token=<token>
+    """
+    from fastapi.responses import FileResponse
+    if token != _EXPORT_TOKEN:
+        raise HTTPException(403, "Token non valido")
+    if not _EXPORT_ZIP_PATH.exists():
+        raise HTTPException(404, "Archivio non trovato — rigenera lo ZIP")
+    return FileResponse(
+        path=str(_EXPORT_ZIP_PATH),
+        filename="fantacalcio-source.zip",
+        media_type="application/zip",
+    )
+
 app.include_router(api)
 
 app.add_middleware(
