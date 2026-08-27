@@ -88,9 +88,16 @@ export default function Mercato() {
   const toggleMercato = async () => {
     if (!league) return;
     try {
-      if (league.transfer_window_open) await api.mercatoClose(league.id);
-      else await api.mercatoOpen(league.id);
-      showToast(league.transfer_window_open ? 'Mercato chiuso' : 'Mercato aperto');
+      const isListinoMode = league.mode === 'listino';
+      if (isListinoMode) {
+        if (league.kickoff_locked) await api.kickoffUnlock(league.id);
+        else await api.kickoffLock(league.id);
+        showToast(league.kickoff_locked ? 'Listino sbloccato' : 'Listino bloccato (kickoff)');
+      } else {
+        if (league.transfer_window_open) await api.mercatoClose(league.id);
+        else await api.mercatoOpen(league.id);
+        showToast(league.transfer_window_open ? 'Mercato chiuso' : 'Mercato aperto');
+      }
       await refresh();
       await load();
     } catch (e: any) {
@@ -107,7 +114,15 @@ export default function Mercato() {
   }
 
   const isAdmin = league?.admin_id === user?.id;
-  const isOpen = league?.transfer_window_open;
+  const isListino = league?.mode === 'listino';
+  // "isOpen" = market is currently allowing actions
+  const isOpen = isListino ? !league?.kickoff_locked : !!league?.transfer_window_open;
+  const statusLabel = isListino
+    ? (league?.kickoff_locked ? '● Bloccato (kickoff)' : '● Listino aperto — sempre attivo')
+    : (isOpen ? '● Aperto — Riparazione attiva' : '○ Chiuso');
+  const toggleLabel = isListino
+    ? (league?.kickoff_locked ? 'Sblocca' : 'Blocca')
+    : (league?.transfer_window_open ? 'Chiudi' : 'Apri');
 
   return (
     <SafeAreaView style={styles.root} edges={['top']} testID="mercato-screen">
@@ -116,16 +131,14 @@ export default function Mercato() {
           <Ionicons name="arrow-back" size={20} color={theme.colors.onSurface} />
         </Pressable>
         <View style={{ flex: 1 }}>
-          <Text style={styles.title}>Mercato</Text>
-          <Text style={styles.subtitle}>
-            {isOpen ? '● Aperto — Riparazione attiva' : '○ Chiuso'}
-          </Text>
+          <Text style={styles.title}>{isListino ? 'Listino' : 'Mercato'}</Text>
+          <Text style={styles.subtitle}>{statusLabel}</Text>
         </View>
         {isAdmin && (
           <Pressable onPress={toggleMercato} testID="toggle-mercato"
             style={[styles.toggleBtn, isOpen && styles.toggleBtnOpen]}>
             <Text style={[styles.toggleTxt, isOpen && styles.toggleTxtOpen]}>
-              {isOpen ? 'Chiudi' : 'Apri'}
+              {toggleLabel}
             </Text>
           </Pressable>
         )}
@@ -265,7 +278,13 @@ export default function Mercato() {
           <View style={styles.closedBanner}>
             <Ionicons name="lock-closed" size={16} color={theme.colors.warning} />
             <Text style={styles.closedText}>
-              Il mercato è chiuso. {isAdmin ? 'Aprilo per permettere svincoli e acquisti.' : "Attendi che l'admin apra la finestra."}
+              {isListino
+                ? (isAdmin
+                    ? 'Il listino è bloccato per il kickoff. Sbloccalo per riaprire scambi.'
+                    : 'Listino bloccato per il kickoff dei match — riapre a fine giornata.')
+                : (isAdmin
+                    ? 'Il mercato è chiuso. Aprilo per permettere svincoli e acquisti.'
+                    : "Attendi che l'admin apra la finestra di mercato.")}
             </Text>
           </View>
         )}

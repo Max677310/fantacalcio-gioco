@@ -17,6 +17,7 @@ export default function SignUp() {
   const router = useRouter();
   const { register } = useAuth();
   const [mode, setMode] = useState<Mode>('create');
+  const [leagueMode, setLeagueMode] = useState<'asta' | 'listino'>('asta');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -44,6 +45,7 @@ export default function SignUp() {
         team_name: teamName.trim(),
         invite_code: mode === 'join' ? inviteCode.trim() : undefined,
         league_name: mode === 'create' ? (leagueName.trim() || undefined) : undefined,
+        mode: mode === 'create' ? leagueMode : undefined,
       });
       router.replace('/(tabs)');
     } catch (e: any) {
@@ -113,9 +115,33 @@ export default function SignUp() {
                 value={teamName} onChangeText={setTeamName} />
 
               {mode === 'create' ? (
-                <Field icon="trophy-outline" testID="sign-up-league-name-input"
-                  placeholder="Nome della lega (opzionale)"
-                  value={leagueName} onChangeText={setLeagueName} />
+                <>
+                  <Field icon="trophy-outline" testID="sign-up-league-name-input"
+                    placeholder="Nome della lega (opzionale)"
+                    value={leagueName} onChangeText={setLeagueName} />
+                  <View style={styles.modeRow}>
+                    <Pressable
+                      testID="mode-asta"
+                      onPress={() => setLeagueMode('asta')}
+                      style={[styles.modeCard, leagueMode === 'asta' && styles.modeCardActive]}
+                    >
+                      <Ionicons name="flame" size={18}
+                        color={leagueMode === 'asta' ? theme.colors.brandSecondary : theme.colors.onSurfaceSecondary} />
+                      <Text style={[styles.modeTitle, leagueMode === 'asta' && styles.modeTitleActive]}>Asta Live</Text>
+                      <Text style={styles.modeDesc}>Rilanci · esclusiva</Text>
+                    </Pressable>
+                    <Pressable
+                      testID="mode-listino"
+                      onPress={() => setLeagueMode('listino')}
+                      style={[styles.modeCard, leagueMode === 'listino' && styles.modeCardActive]}
+                    >
+                      <Ionicons name="pricetags" size={18}
+                        color={leagueMode === 'listino' ? theme.colors.brandSecondary : theme.colors.onSurfaceSecondary} />
+                      <Text style={[styles.modeTitle, leagueMode === 'listino' && styles.modeTitleActive]}>Listino</Text>
+                      <Text style={styles.modeDesc}>Mercato libero</Text>
+                    </Pressable>
+                  </View>
+                </>
               ) : (
                 <Field icon="key-outline" testID="sign-up-code-input" placeholder="Codice invito (6 cifre)"
                   value={inviteCode} onChangeText={(t) => setInviteCode(t.replace(/[^0-9A-Za-z]/g, '').slice(0, 8))}
@@ -211,4 +237,19 @@ const styles = StyleSheet.create({
   footerRow: { flexDirection: 'row', justifyContent: 'center', gap: 6, marginTop: theme.spacing.md },
   footerLabel: { color: theme.colors.onSurfaceSecondary, fontSize: 14 },
   footerLink: { color: theme.colors.brandPrimary, fontSize: 14, fontWeight: '700' },
+  modeRow: { flexDirection: 'row', gap: 10, marginTop: 4, marginBottom: theme.spacing.sm },
+  modeCard: {
+    flex: 1, padding: theme.spacing.md,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: theme.radius.md,
+    borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.1)',
+    gap: 6,
+  },
+  modeCardActive: {
+    backgroundColor: 'rgba(212,175,55,0.12)',
+    borderColor: theme.colors.brandSecondary,
+  },
+  modeTitle: { color: theme.colors.onSurfaceSecondary, fontSize: 14, fontWeight: '800' },
+  modeTitleActive: { color: theme.colors.brandSecondary },
+  modeDesc: { color: theme.colors.onSurfaceSecondary, fontSize: 11 },
 });

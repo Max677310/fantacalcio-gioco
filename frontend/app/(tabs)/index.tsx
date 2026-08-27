@@ -97,6 +97,7 @@ export default function Dashboard() {
     );
   }
 
+  const isListino = league?.mode === 'listino';
   const rankColor =
     summary.rank === 1 ? theme.colors.brandSecondary :
     summary.rank <= 3 ? theme.colors.brandPrimary : theme.colors.onSurface;
@@ -112,7 +113,19 @@ export default function Dashboard() {
           <View style={{ flex: 1 }}>
             <Text style={styles.hi}>Ciao, {user?.name?.split(' ')[0]}</Text>
             <Text style={styles.leagueName} numberOfLines={1}>{summary.my_team_name}</Text>
-            <Text style={styles.leagueSub} numberOfLines={1}>{summary.league.name}</Text>
+            <View style={styles.leagueSubRow}>
+              <Text style={styles.leagueSub} numberOfLines={1}>{summary.league.name}</Text>
+              <View style={[styles.modeBadge, isListino ? styles.modeBadgeListino : styles.modeBadgeAsta]}>
+                <Ionicons
+                  name={isListino ? 'pricetags' : 'flame'}
+                  size={10}
+                  color={isListino ? theme.colors.brandPrimary : theme.colors.error}
+                />
+                <Text style={[styles.modeBadgeText, { color: isListino ? theme.colors.brandPrimary : theme.colors.error }]}>
+                  {isListino ? 'LISTINO' : 'ASTA'}
+                </Text>
+              </View>
+            </View>
           </View>
           <Pressable onPress={logout} style={styles.iconBtn} testID="logout-button" hitSlop={8}>
             <Ionicons name="log-out-outline" size={22} color={theme.colors.onSurface} />
@@ -157,8 +170,13 @@ export default function Dashboard() {
 
         {/* Quick actions */}
         <View style={styles.quickRow}>
-          <QuickAction icon="flame" label="Asta Live" tint={theme.colors.error} badge="LIVE"
-            onPress={() => router.push('/(tabs)/auction')} testID="qa-auction" />
+          {isListino ? (
+            <QuickAction icon="pricetags" label="Listino" tint={theme.colors.brandSecondary}
+              onPress={() => router.push('/mercato')} testID="qa-listino" />
+          ) : (
+            <QuickAction icon="flame" label="Asta Live" tint={theme.colors.error} badge="LIVE"
+              onPress={() => router.push('/(tabs)/auction')} testID="qa-auction" />
+          )}
           <QuickAction icon="radio" label="Live Match" tint={theme.colors.success} badge="LIVE"
             onPress={() => router.push('/live')} testID="qa-live" />
           <QuickAction icon="swap-horizontal" label="Mercato" tint={theme.colors.brandSecondary}
@@ -268,7 +286,15 @@ const styles = StyleSheet.create({
   },
   hi: { color: theme.colors.onSurfaceSecondary, fontSize: 13, marginBottom: 2 },
   leagueName: { color: theme.colors.onSurface, fontSize: 22, fontWeight: '800', letterSpacing: -0.3, maxWidth: 280 },
-  leagueSub: { color: theme.colors.onSurfaceSecondary, fontSize: 12, marginTop: 2, maxWidth: 280 },
+  leagueSub: { color: theme.colors.onSurfaceSecondary, fontSize: 12, marginTop: 2, maxWidth: 200 },
+  leagueSubRow: { flexDirection: 'row', alignItems: 'center', gap: 8, marginTop: 4 },
+  modeBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: 6, paddingVertical: 3, borderRadius: 4, borderWidth: 1,
+  },
+  modeBadgeAsta: { backgroundColor: 'rgba(239,68,68,0.12)', borderColor: 'rgba(239,68,68,0.4)' },
+  modeBadgeListino: { backgroundColor: 'rgba(16,185,129,0.12)', borderColor: 'rgba(16,185,129,0.4)' },
+  modeBadgeText: { fontSize: 9, fontWeight: '800', letterSpacing: 0.6 },
   iconBtn: {
     width: 40, height: 40, borderRadius: 20,
     alignItems: 'center', justifyContent: 'center',

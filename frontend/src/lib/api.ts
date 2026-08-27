@@ -31,6 +31,8 @@ export type RegisterPayload = {
   team_name?: string;
   invite_code?: string;
   league_name?: string;
+  mode?: 'asta' | 'listino';
+  start_matchday?: number;
 };
 
 export const api = {
@@ -40,8 +42,14 @@ export const api = {
     request<any>('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }, false),
   me: () => request<any>('/auth/me'),
   myLeagues: () => request<any[]>('/leagues/mine'),
-  createLeague: (name: string, team_name: string) =>
-    request<any>('/leagues/create', { method: 'POST', body: JSON.stringify({ name, team_name }) }),
+  createLeague: (name: string, team_name: string, mode: 'asta' | 'listino' = 'asta', start_matchday: number = 1) =>
+    request<any>('/leagues/create', { method: 'POST', body: JSON.stringify({ name, team_name, mode, start_matchday }) }),
+  updateLeagueSettings: (leagueId: string, body: { start_matchday?: number; name?: string }) =>
+    request<any>(`/leagues/${leagueId}/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
+  kickoffLock: (leagueId: string) =>
+    request<any>(`/leagues/${leagueId}/kickoff/lock`, { method: 'POST' }),
+  kickoffUnlock: (leagueId: string) =>
+    request<any>(`/leagues/${leagueId}/kickoff/unlock`, { method: 'POST' }),
   joinLeague: (code: string, team_name: string) =>
     request<any>('/leagues/join', { method: 'POST', body: JSON.stringify({ code, team_name }) }),
   leagueMembers: (leagueId: string) => request<any[]>(`/leagues/${leagueId}/members`),

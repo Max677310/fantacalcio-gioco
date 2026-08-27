@@ -31,7 +31,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 7  # 7 days
 
-SEED_VERSION = 6  # bump to force re-seed with wallets/rosters/fixtures/live_events
+SEED_VERSION = 8  # bump to force re-seed with start_matchday
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -61,6 +61,8 @@ class UserRegister(BaseModel):
     team_name: Optional[str] = None
     invite_code: Optional[str] = None
     league_name: Optional[str] = None
+    mode: Optional[Literal["asta", "listino"]] = "asta"
+    start_matchday: Optional[int] = Field(default=1, ge=1, le=38)
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -87,8 +89,11 @@ class League(BaseModel):
     code: str
     admin_id: str
     member_ids: List[str] = []
+    mode: Literal["asta", "listino"] = "asta"
     budget_per_user: int = 500
     transfer_window_open: bool = False
+    kickoff_locked: bool = False
+    start_matchday: int = 1  # Serie A matchday from which the league starts tracking
     created_at: datetime
 
 class Wallet(BaseModel):
@@ -277,13 +282,19 @@ def generate_round_robin(user_ids: List[str]) -> List[List[tuple]]:
 
 
 async def build_fixtures(league_id: str) -> None:
-    """Regenerate the full round-robin fixtures for a league."""
+    """Regenerate the full round-robin fixtures for a league.
+    Matchday numbers are offset by the league's `start_matchday` (Serie A calendar).
+    """
     memberships = await db.memberships.find(
         {"league_id": league_id}, {"_id": 0}
     ).sort("joined_at", 1).to_list(100)
     if len(memberships) < 2:
         await db.fixtures.delete_many({"league_id": league_id})
         return
+    league_doc = await db.leagues.find_one({"id": league_id}, {"_id": 0}) or {}
+    start_md = int(league_doc.get("start_matchday") or 1)
+    if start_md < 1: start_md = 1
+    if start_md > 38: start_md = 38
     uid_to_team = {m["user_id"]: m["team_name"] for m in memberships}
     user_ids = [m["user_id"] for m in memberships]
     rounds = generate_round_robin(user_ids)
@@ -291,7 +302,9 @@ async def build_fixtures(league_id: str) -> None:
     await db.fixtures.delete_many({"league_id": league_id})
     docs = []
     for idx, pairs in enumerate(rounds):
-        matchday = idx + 1
+        matchday = start_md + idx
+        if matchday > 38:
+            break  # Serie A season has 38 matchdays
         for home, away in pairs:
             if home is None or away is None:
                 bye_uid = home or away
@@ -339,17 +352,26 @@ async def init_roster(league_id: str, user_id: str, team_name: str) -> None:
     })
 
 
-async def create_league_for_user(user: dict, league_name: str, team_name: str) -> dict:
+async def create_league_for_user(user: dict, league_name: str, team_name: str, mode: str = "asta", start_matchday: int = 1) -> dict:
     league_id = str(uuid.uuid4())
     code = await gen_invite_code()
+    try:
+        start_md = int(start_matchday)
+    except Exception:
+        start_md = 1
+    if start_md < 1: start_md = 1
+    if start_md > 38: start_md = 38
     league_doc = {
         "id": league_id,
         "name": league_name.strip() or f"Lega di {user['name']}",
         "code": code,
         "admin_id": user["id"],
         "member_ids": [user["id"]],
+        "mode": mode if mode in ("asta", "listino") else "asta",
         "budget_per_user": 500,
         "transfer_window_open": False,
+        "kickoff_locked": False,
+        "start_matchday": start_md,
         "created_at": now_iso(),
         "is_demo": False,
     }
@@ -440,6 +462,8 @@ async def register(data: UserRegister):
             user_doc,
             data.league_name or f"Lega di {data.name}",
             data.team_name,
+            data.mode or "asta",
+            data.start_matchday or 1,
         )
 
     return Token(access_token=make_token(uid),
@@ -465,6 +489,8 @@ async def me(current=Depends(get_current_user)):
 class LeagueCreate(BaseModel):
     name: Optional[str] = None
     team_name: str = Field(min_length=1, max_length=48)
+    mode: Optional[Literal["asta", "listino"]] = "asta"
+    start_matchday: Optional[int] = Field(default=1, ge=1, le=38)
 
 class LeagueJoin(BaseModel):
     code: str = Field(min_length=4, max_length=12)
@@ -473,7 +499,9 @@ class LeagueJoin(BaseModel):
 @api.post("/leagues/create", response_model=League)
 async def create_league(body: LeagueCreate, current=Depends(get_current_user)):
     league = await create_league_for_user(
-        current, body.name or f"Lega di {current['name']}", body.team_name
+        current, body.name or f"Lega di {current['name']}",
+        body.team_name, body.mode or "asta",
+        body.start_matchday or 1,
     )
     return League(**league)
 
@@ -762,8 +790,13 @@ class ReleaseRequest(BaseModel):
 async def release_player(league_id: str, body: ReleaseRequest, current=Depends(get_current_user)):
     await require_membership(league_id, current)
     league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
-    if not (league or {}).get("transfer_window_open"):
-        raise HTTPException(400, "Il mercato di riparazione non è aperto")
+    mode = (league or {}).get("mode", "asta")
+    if mode == "asta":
+        if not (league or {}).get("transfer_window_open"):
+            raise HTTPException(400, "Il mercato di riparazione non è aperto")
+    else:  # listino
+        if (league or {}).get("kickoff_locked"):
+            raise HTTPException(400, "Il mercato è bloccato per il kickoff")
     roster = await db.rosters.find_one(
         {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
     )
@@ -773,12 +806,10 @@ async def release_player(league_id: str, body: ReleaseRequest, current=Depends(g
     if not entry:
         raise HTTPException(404, "Giocatore non presente nella tua rosa")
     refund = max(1, int(entry["price_paid"] * 0.5))
-    # Remove from roster
     await db.rosters.update_one(
         {"league_id": league_id, "user_id": current["id"]},
         {"$pull": {"entries": {"player_id": body.player_id}}},
     )
-    # Refund wallet
     await db.wallets.update_one(
         {"league_id": league_id, "user_id": current["id"]},
         {"$inc": {"spent": -refund, "remaining": refund}},
@@ -797,14 +828,26 @@ class BuyRequest(BaseModel):
 async def buy_free_agent(league_id: str, body: BuyRequest, current=Depends(get_current_user)):
     await require_membership(league_id, current)
     league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
-    if not (league or {}).get("transfer_window_open"):
-        raise HTTPException(400, "Il mercato di riparazione non è aperto")
-    # Ensure player is a free agent (not owned in this league)
-    owned = await db.rosters.find_one(
-        {"league_id": league_id, "entries.player_id": body.player_id}, {"_id": 0}
-    )
-    if owned:
-        raise HTTPException(400, "Giocatore già di proprietà di un altro manager")
+    mode = (league or {}).get("mode", "asta")
+    if mode == "asta":
+        if not (league or {}).get("transfer_window_open"):
+            raise HTTPException(400, "Il mercato di riparazione non è aperto")
+        # Exclusivity check: only 1 owner across the league
+        owned = await db.rosters.find_one(
+            {"league_id": league_id, "entries.player_id": body.player_id}, {"_id": 0}
+        )
+        if owned:
+            raise HTTPException(400, "Giocatore già di proprietà di un altro manager")
+    else:  # listino
+        if (league or {}).get("kickoff_locked"):
+            raise HTTPException(400, "Il listino è bloccato per il kickoff")
+        # Can't buy the same player twice yourself
+        mine = await db.rosters.find_one(
+            {"league_id": league_id, "user_id": current["id"], "entries.player_id": body.player_id},
+            {"_id": 0},
+        )
+        if mine:
+            raise HTTPException(400, "Questo giocatore è già nella tua rosa")
     player = await db.players.find_one({"id": body.player_id}, {"_id": 0})
     if not player:
         raise HTTPException(404, "Giocatore non trovato")
@@ -829,6 +872,63 @@ async def buy_free_agent(league_id: str, body: BuyRequest, current=Depends(get_c
     return Wallet(**w)
 
 
+@api.post("/leagues/{league_id}/kickoff/lock", response_model=League)
+async def kickoff_lock(league_id: str, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
+    await db.leagues.update_one({"id": league_id}, {"$set": {"kickoff_locked": True}})
+    l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    return League(**l)
+
+
+@api.post("/leagues/{league_id}/kickoff/unlock", response_model=League)
+async def kickoff_unlock(league_id: str, current=Depends(get_current_user)):
+    await require_admin(league_id, current)
+    await db.leagues.update_one({"id": league_id}, {"$set": {"kickoff_locked": False}})
+    l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    return League(**l)
+
+
+class LeagueSettingsUpdate(BaseModel):
+    start_matchday: Optional[int] = Field(default=None, ge=1, le=38)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+@api.patch("/leagues/{league_id}/settings", response_model=League)
+async def update_league_settings(
+    league_id: str,
+    body: LeagueSettingsUpdate,
+    current=Depends(get_current_user),
+):
+    """Admin-only: update mutable league settings.
+    - `start_matchday`: only editable BEFORE kickoff is locked (regenerates fixtures).
+    - `name`: always editable by admin.
+    """
+    await require_admin(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not league:
+        raise HTTPException(404, "Lega non trovata")
+
+    updates: dict = {}
+    regenerate = False
+    if body.name is not None:
+        updates["name"] = body.name.strip()
+    if body.start_matchday is not None:
+        if league.get("kickoff_locked"):
+            raise HTTPException(400, "Non puoi cambiare la giornata di partenza dopo il kickoff")
+        new_md = int(body.start_matchday)
+        if new_md != int(league.get("start_matchday") or 1):
+            updates["start_matchday"] = new_md
+            regenerate = True
+
+    if updates:
+        await db.leagues.update_one({"id": league_id}, {"$set": updates})
+    if regenerate:
+        await build_fixtures(league_id)
+
+    l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    return League(**l)
+
+
 @api.get("/leagues/{league_id}/free-agents", response_model=List[Player])
 async def free_agents(
     league_id: str,
@@ -837,19 +937,29 @@ async def free_agents(
     current=Depends(get_current_user),
 ):
     await require_membership(league_id, current)
-    # Collect owned player ids across all rosters in this league
-    cursor = db.rosters.find({"league_id": league_id}, {"_id": 0, "entries": 1})
-    owned_ids = set()
-    async for r in cursor:
-        for e in r.get("entries", []):
-            owned_ids.add(e["player_id"])
-    query = {"id": {"$nin": list(owned_ids)}}
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    mode = (league or {}).get("mode", "asta")
+    owned_ids: set = set()
+    if mode == "asta":
+        # Only players not owned by anyone in the league
+        cursor = db.rosters.find({"league_id": league_id}, {"_id": 0, "entries": 1})
+        async for r in cursor:
+            for e in r.get("entries", []):
+                owned_ids.add(e["player_id"])
+    else:
+        # Listino: exclude only players already in MY roster (others can still own them)
+        mine = await db.rosters.find_one(
+            {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
+        )
+        if mine:
+            owned_ids = {e["player_id"] for e in mine.get("entries", [])}
+    query = {"id": {"$nin": list(owned_ids)}} if owned_ids else {}
     if role:
         query["role"] = role
     if q:
         query["name"] = {"$regex": re.escape(q[:64]), "$options": "i"}
-    cur2 = db.players.find(query, {"_id": 0}).sort("price", -1).limit(80)
-    return [Player(**p) for p in await cur2.to_list(80)]
+    cur2 = db.players.find(query, {"_id": 0}).sort("price", -1).limit(120)
+    return [Player(**p) for p in await cur2.to_list(120)]
 
 
 # ------------------------------------------------------------
@@ -979,12 +1089,18 @@ async def dashboard(league_id: str, current=Depends(get_current_user)):
         {"league_id": league_id, "user_id": current["id"]}, {"_id": 0}
     )
     team_name = (m or {}).get("team_name") or current["name"]
+    # Compute the next matchday for this league (min matchday from fixtures)
+    first_fixture = await db.fixtures.find_one(
+        {"league_id": league_id}, {"_id": 0}, sort=[("matchday", 1)]
+    )
+    start_md = int(l.get("start_matchday") or 1)
+    next_md = int((first_fixture or {}).get("matchday") or start_md)
     return DashboardSummary(
         league=League(**l),
         my_team_name=team_name,
         rank=rank,
         points=points,
-        next_matchday=6,
+        next_matchday=next_md,
         next_kickoff=datetime.now(timezone.utc) + timedelta(days=2, hours=3),
         members=len(l.get("member_ids", [])),
     )
@@ -1115,8 +1231,11 @@ async def seed():
             "code": DEMO_LEAGUE_CODE,
             "admin_id": demo_id,
             "member_ids": all_member_ids,
+            "mode": "asta",
             "budget_per_user": 500,
             "transfer_window_open": False,
+            "kickoff_locked": False,
+            "start_matchday": 1,
             "created_at": now_iso(),
             "is_demo": True,
         })

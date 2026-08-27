@@ -21,8 +21,10 @@ export default function Onboarding() {
   const { user, logout } = useAuth();
   const { refresh } = useLeague();
   const [mode, setMode] = useState<Mode>('create');
+  const [leagueMode, setLeagueMode] = useState<'asta' | 'listino'>('asta');
   const [teamName, setTeamName] = useState('');
   const [leagueName, setLeagueName] = useState('');
+  const [startMatchday, setStartMatchday] = useState<number>(1);
   const [code, setCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,7 +36,7 @@ export default function Onboarding() {
     setLoading(true);
     try {
       if (mode === 'create') {
-        await api.createLeague(leagueName.trim() || `Lega di ${user?.name}`, teamName.trim());
+        await api.createLeague(leagueName.trim() || `Lega di ${user?.name}`, teamName.trim(), leagueMode, startMatchday);
       } else {
         await api.joinLeague(code.trim(), teamName.trim());
       }
@@ -107,17 +109,84 @@ export default function Onboarding() {
                 </View>
 
                 {mode === 'create' ? (
-                  <View style={styles.field}>
-                    <Ionicons name="trophy-outline" size={18} color={theme.colors.onSurfaceSecondary} />
-                    <TextInput
-                      testID="onboarding-league-input"
-                      style={styles.input}
-                      placeholder="Nome della lega (opzionale)"
-                      placeholderTextColor={theme.colors.onSurfaceSecondary}
-                      value={leagueName}
-                      onChangeText={setLeagueName}
-                    />
-                  </View>
+                  <>
+                    <View style={styles.field}>
+                      <Ionicons name="trophy-outline" size={18} color={theme.colors.onSurfaceSecondary} />
+                      <TextInput
+                        testID="onboarding-league-input"
+                        style={styles.input}
+                        placeholder="Nome della lega (opzionale)"
+                        placeholderTextColor={theme.colors.onSurfaceSecondary}
+                        value={leagueName}
+                        onChangeText={setLeagueName}
+                      />
+                    </View>
+                    <View style={styles.modeRow}>
+                      <Pressable
+                        testID="onboarding-mode-asta"
+                        onPress={() => setLeagueMode('asta')}
+                        style={[styles.modeCard, leagueMode === 'asta' && styles.modeCardActive]}
+                      >
+                        <Ionicons name="flame" size={20}
+                          color={leagueMode === 'asta' ? theme.colors.brandSecondary : theme.colors.onSurfaceSecondary} />
+                        <Text style={[styles.modeTitle, leagueMode === 'asta' && styles.modeTitleActive]}>Asta Live</Text>
+                        <Text style={styles.modeDesc}>Aste a rilanci con giocatori esclusivi</Text>
+                      </Pressable>
+                      <Pressable
+                        testID="onboarding-mode-listino"
+                        onPress={() => setLeagueMode('listino')}
+                        style={[styles.modeCard, leagueMode === 'listino' && styles.modeCardActive]}
+                      >
+                        <Ionicons name="pricetags" size={20}
+                          color={leagueMode === 'listino' ? theme.colors.brandSecondary : theme.colors.onSurfaceSecondary} />
+                        <Text style={[styles.modeTitle, leagueMode === 'listino' && styles.modeTitleActive]}>Listino</Text>
+                        <Text style={styles.modeDesc}>Mercato libero, stessi giocatori condivisibili</Text>
+                      </Pressable>
+                    </View>
+
+                    <View style={styles.matchdayBlock}>
+                      <View style={styles.matchdayHead}>
+                        <Ionicons name="calendar" size={16} color={theme.colors.brandSecondary} />
+                        <Text style={styles.matchdayLabel}>Giornata di partenza</Text>
+                        <View style={styles.matchdayValue}>
+                          <Text style={styles.matchdayValueText}>{startMatchday}ª</Text>
+                        </View>
+                      </View>
+                      <Text style={styles.matchdayHelp}>
+                        Da quale giornata di Serie A la lega inizia a tracciare i punteggi.
+                      </Text>
+                      <View style={styles.matchdayControls}>
+                        <Pressable
+                          testID="matchday-dec"
+                          onPress={() => setStartMatchday((v) => Math.max(1, v - 1))}
+                          style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                          hitSlop={6}
+                        >
+                          <Ionicons name="remove" size={20} color={theme.colors.onSurface} />
+                        </Pressable>
+                        <View style={styles.mdSlider}>
+                          {[1, 5, 10, 15, 20, 25, 30, 35, 38].map((n) => (
+                            <Pressable
+                              key={n}
+                              testID={`matchday-quick-${n}`}
+                              onPress={() => setStartMatchday(n)}
+                              style={[styles.mdChip, startMatchday === n && styles.mdChipActive]}
+                            >
+                              <Text style={[styles.mdChipText, startMatchday === n && styles.mdChipTextActive]}>{n}</Text>
+                            </Pressable>
+                          ))}
+                        </View>
+                        <Pressable
+                          testID="matchday-inc"
+                          onPress={() => setStartMatchday((v) => Math.min(38, v + 1))}
+                          style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                          hitSlop={6}
+                        >
+                          <Ionicons name="add" size={20} color={theme.colors.onSurface} />
+                        </Pressable>
+                      </View>
+                    </View>
+                  </>
                 ) : (
                   <View style={styles.field}>
                     <Ionicons name="key-outline" size={18} color={theme.colors.onSurfaceSecondary} />
@@ -203,4 +272,57 @@ const styles = StyleSheet.create({
   cta: { marginTop: theme.spacing.md, backgroundColor: theme.colors.brandSecondary, borderRadius: theme.radius.md, paddingVertical: 15, alignItems: 'center' },
   ctaText: { color: theme.colors.onBrandSecondary, fontSize: 15, fontWeight: '800', letterSpacing: 0.3 },
   hint: { color: theme.colors.onSurfaceSecondary, fontSize: 12, marginTop: 10, textAlign: 'center' },
+  modeRow: { flexDirection: 'row', gap: 10, marginTop: 4 },
+  modeCard: {
+    flex: 1, padding: theme.spacing.md,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: theme.radius.md,
+    borderWidth: 1.5, borderColor: 'rgba(255,255,255,0.1)',
+    gap: 6,
+  },
+  modeCardActive: {
+    backgroundColor: 'rgba(212,175,55,0.12)',
+    borderColor: theme.colors.brandSecondary,
+  },
+  modeTitle: { color: theme.colors.onSurfaceSecondary, fontSize: 14, fontWeight: '800' },
+  modeTitleActive: { color: theme.colors.brandSecondary },
+  modeDesc: { color: theme.colors.onSurfaceSecondary, fontSize: 11, lineHeight: 15 },
+  matchdayBlock: {
+    marginTop: theme.spacing.md,
+    backgroundColor: 'rgba(255,255,255,0.05)',
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.md,
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)',
+  },
+  matchdayHead: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  matchdayLabel: { color: theme.colors.onSurface, fontSize: 13, fontWeight: '700', flex: 1 },
+  matchdayValue: {
+    backgroundColor: 'rgba(212,175,55,0.15)',
+    paddingHorizontal: 10, paddingVertical: 3,
+    borderRadius: theme.radius.pill,
+    borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+  },
+  matchdayValueText: { color: theme.colors.brandSecondary, fontSize: 13, fontWeight: '800' },
+  matchdayHelp: { color: theme.colors.onSurfaceSecondary, fontSize: 11, lineHeight: 15, marginTop: 6, marginBottom: 10 },
+  matchdayControls: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  mdBtn: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: theme.colors.surfaceTertiary,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  mdSlider: { flex: 1, flexDirection: 'row', flexWrap: 'wrap', gap: 4, justifyContent: 'center' },
+  mdChip: {
+    minWidth: 30, height: 26, paddingHorizontal: 6,
+    borderRadius: 13,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)',
+  },
+  mdChipActive: {
+    backgroundColor: theme.colors.brandSecondary,
+    borderColor: theme.colors.brandSecondary,
+  },
+  mdChipText: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '700' },
+  mdChipTextActive: { color: theme.colors.onBrandSecondary, fontWeight: '800' },
 });

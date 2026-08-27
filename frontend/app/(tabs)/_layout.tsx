@@ -25,6 +25,8 @@ export default function TabsLayout() {
     );
   }
 
+  const isListino = league?.mode === 'listino';
+
   return (
     <Tabs
       screenOptions={{
@@ -43,6 +45,7 @@ export default function TabsLayout() {
       }} />
       <Tabs.Screen name="auction" options={{
         title: 'Asta',
+        href: isListino ? null : '/(tabs)/auction',
         tabBarIcon: ({ color, size }) => (
           <View>
             <Ionicons name="flame" size={size ?? 22} color={color} />

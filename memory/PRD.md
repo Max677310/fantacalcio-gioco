@@ -47,3 +47,7 @@ Cross-platform Expo React Native mobile app for **Italian Fantasy Football (Fant
 - Live matchday scoring engine using Serie A API
 - Roster building phase (winning players from asta → rosa)
 - League invite deep-link (URL scheme)
+- Automated Monday API (manual admin upload / smart mock ratings + auto bench subs)
+
+## Recently completed
+- **Giornata di partenza personalizzata** (v8): admin can pick which Serie A matchday (1-38) the league starts tracking from. Fixtures are numbered accordingly. Editable pre-kickoff via `PATCH /api/leagues/{id}/settings`.

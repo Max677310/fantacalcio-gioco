@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, Pressable, RefreshControl,
-  ActivityIndicator, Share, Platform,
+  ActivityIndicator, Share, Platform, Modal, Alert,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import * as Clipboard from 'expo-clipboard';
@@ -14,12 +14,15 @@ import { theme } from '@/src/lib/theme';
 type Member = { user_id: string; user_name: string; team_name: string; role: string; joined_at: string };
 
 export default function LeagueTab() {
-  const { league } = useLeague();
+  const { league, refresh } = useLeague();
   const { user } = useAuth();
   const [members, setMembers] = useState<Member[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [showMdModal, setShowMdModal] = useState(false);
+  const [pendingMd, setPendingMd] = useState<number>(1);
+  const [savingMd, setSavingMd] = useState(false);
 
   const load = useCallback(async () => {
     if (!league) return;
@@ -58,6 +61,29 @@ export default function LeagueTab() {
   }
 
   const isAdmin = league.admin_id === user?.id;
+  const startMatchday: number = (league as any).start_matchday || 1;
+  const kickoffLocked: boolean = !!(league as any).kickoff_locked;
+  const canEditMd = isAdmin && !kickoffLocked;
+
+  const openMdModal = () => {
+    setPendingMd(startMatchday);
+    setShowMdModal(true);
+  };
+
+  const saveMd = async () => {
+    if (!league) return;
+    if (pendingMd === startMatchday) { setShowMdModal(false); return; }
+    setSavingMd(true);
+    try {
+      await api.updateLeagueSettings(league.id, { start_matchday: pendingMd });
+      await refresh();
+      setShowMdModal(false);
+    } catch (e: any) {
+      Alert.alert('Errore', e?.message || 'Impossibile aggiornare la giornata di partenza');
+    } finally {
+      setSavingMd(false);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.root} edges={['top']} testID="league-screen">
@@ -114,6 +140,31 @@ export default function LeagueTab() {
           </View>
         </View>
 
+        {/* Kickoff / Settings card */}
+        <View style={styles.settingsCard} testID="settings-card">
+          <View style={styles.settingsRow}>
+            <View style={styles.settingsIcon}>
+              <Ionicons name="calendar" size={18} color={theme.colors.brandSecondary} />
+            </View>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.settingsLabel}>Giornata di partenza</Text>
+              <Text style={styles.settingsSub}>
+                {kickoffLocked
+                  ? 'Bloccata dopo il kickoff'
+                  : (canEditMd ? 'La lega inizia dalla giornata selezionata' : 'Solo l\'admin può modificarla')}
+              </Text>
+            </View>
+            <View style={styles.mdBadge}>
+              <Text style={styles.mdBadgeText}>{startMatchday}ª</Text>
+            </View>
+            {canEditMd && (
+              <Pressable testID="edit-start-md" onPress={openMdModal} hitSlop={10} style={styles.editBtn}>
+                <Ionicons name="create-outline" size={18} color={theme.colors.brandSecondary} />
+              </Pressable>
+            )}
+          </View>
+        </View>
+
         {/* Members */}
         <View style={styles.sectionHead}>
           <Text style={styles.sectionTitle}>Membri</Text>
@@ -152,6 +203,85 @@ export default function LeagueTab() {
           })}
         </View>
       </ScrollView>
+
+      {/* Start Matchday Modal */}
+      <Modal
+        visible={showMdModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowMdModal(false)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => !savingMd && setShowMdModal(false)}>
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <View style={styles.modalHead}>
+              <Ionicons name="calendar" size={20} color={theme.colors.brandSecondary} />
+              <Text style={styles.modalTitle}>Giornata di partenza</Text>
+            </View>
+            <Text style={styles.modalSub}>
+              Scegli da quale giornata di Serie A la tua lega inizia a tracciare i punteggi (1-38).
+            </Text>
+
+            <View style={styles.mdBigRow}>
+              <Pressable
+                testID="modal-md-dec"
+                onPress={() => setPendingMd((v) => Math.max(1, v - 1))}
+                style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
+              >
+                <Ionicons name="remove" size={26} color={theme.colors.onSurface} />
+              </Pressable>
+              <View style={styles.mdBigValueWrap}>
+                <Text style={styles.mdBigValue}>{pendingMd}</Text>
+                <Text style={styles.mdBigLabel}>giornata</Text>
+              </View>
+              <Pressable
+                testID="modal-md-inc"
+                onPress={() => setPendingMd((v) => Math.min(38, v + 1))}
+                style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
+              >
+                <Ionicons name="add" size={26} color={theme.colors.onSurface} />
+              </Pressable>
+            </View>
+
+            <View style={styles.mdQuickRow}>
+              {[1, 5, 10, 15, 20, 25, 30, 35, 38].map((n) => (
+                <Pressable
+                  key={n}
+                  testID={`modal-md-quick-${n}`}
+                  onPress={() => setPendingMd(n)}
+                  style={[styles.mdChip, pendingMd === n && styles.mdChipActive]}
+                >
+                  <Text style={[styles.mdChipText, pendingMd === n && styles.mdChipTextActive]}>{n}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <Text style={styles.mdWarning}>
+              ⚠️ Cambiando la giornata verrà rigenerato il calendario partite.
+            </Text>
+
+            <View style={styles.modalBtnRow}>
+              <Pressable
+                testID="modal-md-cancel"
+                onPress={() => setShowMdModal(false)}
+                style={[styles.modalBtn, styles.modalBtnGhost]}
+                disabled={savingMd}
+              >
+                <Text style={styles.modalBtnGhostText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                testID="modal-md-save"
+                onPress={saveMd}
+                style={[styles.modalBtn, styles.modalBtnPrimary, savingMd && { opacity: 0.7 }]}
+                disabled={savingMd}
+              >
+                {savingMd
+                  ? <ActivityIndicator color={theme.colors.onBrandSecondary} />
+                  : <Text style={styles.modalBtnPrimaryText}>Salva</Text>}
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -224,4 +354,79 @@ const styles = StyleSheet.create({
   avatarText: { color: theme.colors.onSurface, fontWeight: '800', fontSize: 16 },
   teamName: { color: theme.colors.onSurface, fontSize: 15, fontWeight: '700', flexShrink: 1 },
   userMeta: { color: theme.colors.onSurfaceSecondary, fontSize: 12, marginTop: 2 },
+
+  settingsCard: {
+    marginTop: theme.spacing.lg,
+    backgroundColor: theme.colors.surfaceSecondary,
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.md,
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  settingsRow: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  settingsIcon: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: 'rgba(212,175,55,0.12)',
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+  },
+  settingsLabel: { color: theme.colors.onSurface, fontSize: 14, fontWeight: '700' },
+  settingsSub: { color: theme.colors.onSurfaceSecondary, fontSize: 11, marginTop: 2 },
+  mdBadge: {
+    backgroundColor: theme.colors.brandSecondary,
+    paddingHorizontal: 12, paddingVertical: 6,
+    borderRadius: theme.radius.pill,
+  },
+  mdBadgeText: { color: theme.colors.onBrandSecondary, fontSize: 13, fontWeight: '800' },
+  editBtn: { padding: 6 },
+
+  modalBackdrop: {
+    flex: 1, backgroundColor: 'rgba(0,0,0,0.7)',
+    justifyContent: 'center', padding: theme.spacing.lg,
+  },
+  modalCard: {
+    backgroundColor: theme.colors.surfaceSecondary,
+    borderRadius: theme.radius.lg,
+    padding: theme.spacing.lg,
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  modalHead: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  modalTitle: { color: theme.colors.onSurface, fontSize: 18, fontWeight: '800' },
+  modalSub: { color: theme.colors.onSurfaceSecondary, fontSize: 12, lineHeight: 17, marginTop: 6, marginBottom: theme.spacing.md },
+  mdBigRow: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    backgroundColor: theme.colors.surfaceTertiary,
+    borderRadius: theme.radius.md,
+    padding: theme.spacing.md,
+    marginVertical: theme.spacing.sm,
+  },
+  mdBigBtn: {
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: theme.colors.surface,
+    alignItems: 'center', justifyContent: 'center',
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  mdBigValueWrap: { alignItems: 'center' },
+  mdBigValue: { color: theme.colors.brandSecondary, fontSize: 40, fontWeight: '800', letterSpacing: -1 },
+  mdBigLabel: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '600', letterSpacing: 1, textTransform: 'uppercase' },
+  mdQuickRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, justifyContent: 'center', marginTop: theme.spacing.sm, marginBottom: theme.spacing.md },
+  mdChip: {
+    minWidth: 36, height: 30, paddingHorizontal: 8,
+    borderRadius: 15,
+    alignItems: 'center', justifyContent: 'center',
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1, borderColor: 'rgba(255,255,255,0.08)',
+  },
+  mdChipActive: {
+    backgroundColor: theme.colors.brandSecondary,
+    borderColor: theme.colors.brandSecondary,
+  },
+  mdChipText: { color: theme.colors.onSurfaceSecondary, fontSize: 12, fontWeight: '700' },
+  mdChipTextActive: { color: theme.colors.onBrandSecondary, fontWeight: '800' },
+  mdWarning: { color: theme.colors.onSurfaceSecondary, fontSize: 11, textAlign: 'center', marginBottom: theme.spacing.md, lineHeight: 15 },
+  modalBtnRow: { flexDirection: 'row', gap: 10 },
+  modalBtn: { flex: 1, paddingVertical: 12, borderRadius: theme.radius.md, alignItems: 'center', justifyContent: 'center' },
+  modalBtnGhost: { backgroundColor: theme.colors.surfaceTertiary, borderWidth: 1, borderColor: theme.colors.border },
+  modalBtnGhostText: { color: theme.colors.onSurface, fontWeight: '700', fontSize: 14 },
+  modalBtnPrimary: { backgroundColor: theme.colors.brandSecondary },
+  modalBtnPrimaryText: { color: theme.colors.onBrandSecondary, fontWeight: '800', fontSize: 14 },
 });
