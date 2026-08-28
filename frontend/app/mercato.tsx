@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
-  View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl,
+  View, Text, StyleSheet, ScrollView, Pressable, ActivityIndicator, RefreshControl, TextInput,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -29,6 +29,7 @@ export default function Mercato() {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [query, setQuery] = useState('');
 
   const showToast = (msg: string, kind: 'ok' | 'err' = 'ok') => {
     setToast({ msg, kind });
@@ -105,6 +106,22 @@ export default function Mercato() {
     }
   };
 
+  // Local search filter (applies to both tabs) — hooks MUST run before any early return
+  const q = query.trim().toLowerCase();
+  const filteredRoster = useMemo(
+    () => roster.filter((e) => {
+      const p = playersById[e.player_id];
+      if (!p) return true;
+      if (!q) return true;
+      return p.name.toLowerCase().includes(q) || (p.team || '').toLowerCase().includes(q);
+    }),
+    [roster, playersById, q]
+  );
+  const filteredFree = useMemo(
+    () => freeAgents.filter((p) => !q || p.name.toLowerCase().includes(q) || (p.team || '').toLowerCase().includes(q)),
+    [freeAgents, q]
+  );
+
   if (loading) {
     return (
       <SafeAreaView style={styles.root} edges={['top']}>
@@ -159,6 +176,29 @@ export default function Mercato() {
         <Text style={styles.walletSpent}>-{wallet?.spent} spesi</Text>
       </View>
 
+      {/* Search bar */}
+      <View style={styles.searchWrap}>
+        <View style={styles.searchBar}>
+          <Ionicons name="search" size={16} color={theme.colors.onSurfaceSecondary} />
+          <TextInput
+            testID="mercato-search"
+            style={styles.searchInput}
+            placeholder="Cerca giocatore o squadra…"
+            placeholderTextColor={theme.colors.onSurfaceSecondary}
+            value={query}
+            onChangeText={setQuery}
+            autoCorrect={false}
+            autoCapitalize="none"
+            returnKeyType="search"
+          />
+          {query.length > 0 && (
+            <Pressable onPress={() => setQuery('')} hitSlop={8} testID="mercato-search-clear">
+              <Ionicons name="close-circle" size={18} color={theme.colors.onSurfaceSecondary} />
+            </Pressable>
+          )}
+        </View>
+      </View>
+
       {/* Tabs */}
       <View style={styles.tabs}>
         <Pressable
@@ -201,9 +241,9 @@ export default function Mercato() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); load(); }} tintColor={theme.colors.brandSecondary} />}
       >
         {tab === 'rosa' ? (
-          roster.length === 0 ? (
-            <Text style={styles.empty}>Nessun giocatore in rosa</Text>
-          ) : roster.map((e, i) => {
+          filteredRoster.length === 0 ? (
+            <Text style={styles.empty}>{q ? `Nessun risultato per "${query}"` : 'Nessun giocatore in rosa'}</Text>
+          ) : filteredRoster.map((e, i) => {
             const p = playersById[e.player_id];
             if (!p) return null;
             const tint = roleColors[p.role];
@@ -241,9 +281,9 @@ export default function Mercato() {
             );
           })
         ) : (
-          freeAgents.length === 0 ? (
-            <Text style={styles.empty}>Nessun free agent disponibile</Text>
-          ) : freeAgents.map((p, i) => {
+          filteredFree.length === 0 ? (
+            <Text style={styles.empty}>{q ? `Nessun risultato per "${query}"` : 'Nessun free agent disponibile'}</Text>
+          ) : filteredFree.map((p, i) => {
             const tint = roleColors[p.role];
             const canAfford = (wallet?.remaining || 0) >= p.price;
             return (
@@ -340,6 +380,16 @@ const styles = StyleSheet.create({
   walletRem: { color: theme.colors.brandSecondary, fontSize: 22, fontWeight: '800' },
   walletBudget: { color: theme.colors.onSurfaceSecondary, fontSize: 14, fontWeight: '600' },
   walletSpent: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '600' },
+
+  searchWrap: { paddingHorizontal: theme.spacing.lg, marginTop: theme.spacing.md },
+  searchBar: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: 12, paddingVertical: 10,
+    borderRadius: theme.radius.pill,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  searchInput: { flex: 1, color: theme.colors.onSurface, fontSize: 14, paddingVertical: 0 },
 
   tabs: { flexDirection: 'row', marginHorizontal: theme.spacing.lg, marginTop: theme.spacing.md,
     backgroundColor: 'rgba(255,255,255,0.06)', borderRadius: theme.radius.pill, padding: 4 },

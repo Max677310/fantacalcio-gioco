@@ -36,7 +36,7 @@ if not JWT_SECRET or len(JWT_SECRET) < 32:
 JWT_ALG = "HS256"
 JWT_TTL_MIN = 60 * 24 * 7  # 7 days
 
-SEED_VERSION = 8  # bump to force re-seed with start_matchday
+SEED_VERSION = 9  # bump to force re-seed with end_matchday
 
 client = AsyncIOMotorClient(MONGO_URL)
 db = client[DB_NAME]
@@ -231,7 +231,8 @@ class UserRegister(BaseModel):
     invite_code: Optional[str] = None
     league_name: Optional[str] = None
     mode: Optional[Literal["asta", "listino"]] = "asta"
-    start_matchday: Optional[int] = Field(default=1, ge=1, le=38)
+    start_matchday: Optional[int] = Field(default=1, ge=1, le=60)
+    end_matchday: Optional[int] = Field(default=38, ge=1, le=60)
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -262,7 +263,11 @@ class League(BaseModel):
     budget_per_user: int = 500
     transfer_window_open: bool = False
     kickoff_locked: bool = False
-    start_matchday: int = 1  # Serie A matchday from which the league starts tracking
+    start_matchday: int = 1   # first Serie A matchday tracked
+    end_matchday: int = 38    # last matchday tracked (inclusive). Can be > 38 for custom tournaments
+    # Scheduled kickoff datetimes per matchday (ISO strings). Key = str(matchday).
+    # Used to auto-lock lineup submissions 5 minutes before the first match.
+    matchday_kickoffs: Dict[str, str] = {}
     created_at: datetime
 
 class Wallet(BaseModel):
@@ -456,7 +461,7 @@ def generate_round_robin(user_ids: List[str]) -> List[List[tuple]]:
 
 async def build_fixtures(league_id: str) -> None:
     """Regenerate the full round-robin fixtures for a league.
-    Matchday numbers are offset by the league's `start_matchday` (Serie A calendar).
+    Matchdays are numbered from `start_matchday` to `end_matchday` (inclusive).
     """
     memberships = await db.memberships.find(
         {"league_id": league_id}, {"_id": 0}
@@ -466,8 +471,11 @@ async def build_fixtures(league_id: str) -> None:
         return
     league_doc = await db.leagues.find_one({"id": league_id}, {"_id": 0}) or {}
     start_md = int(league_doc.get("start_matchday") or 1)
+    end_md = int(league_doc.get("end_matchday") or 38)
     if start_md < 1: start_md = 1
-    if start_md > 38: start_md = 38
+    if end_md < start_md: end_md = start_md
+    if start_md > 60: start_md = 60
+    if end_md > 60: end_md = 60
     uid_to_team = {m["user_id"]: m["team_name"] for m in memberships}
     user_ids = [m["user_id"] for m in memberships]
     rounds = generate_round_robin(user_ids)
@@ -476,8 +484,8 @@ async def build_fixtures(league_id: str) -> None:
     docs = []
     for idx, pairs in enumerate(rounds):
         matchday = start_md + idx
-        if matchday > 38:
-            break  # Serie A season has 38 matchdays
+        if matchday > end_md:
+            break  # respect user-defined end
         for home, away in pairs:
             if home is None or away is None:
                 bye_uid = home or away
@@ -525,15 +533,21 @@ async def init_roster(league_id: str, user_id: str, team_name: str) -> None:
     })
 
 
-async def create_league_for_user(user: dict, league_name: str, team_name: str, mode: str = "asta", start_matchday: int = 1) -> dict:
+async def create_league_for_user(user: dict, league_name: str, team_name: str, mode: str = "asta", start_matchday: int = 1, end_matchday: int = 38) -> dict:
     league_id = str(uuid.uuid4())
     code = await gen_invite_code()
     try:
         start_md = int(start_matchday)
     except Exception:
         start_md = 1
+    try:
+        end_md = int(end_matchday)
+    except Exception:
+        end_md = 38
     if start_md < 1: start_md = 1
-    if start_md > 38: start_md = 38
+    if start_md > 60: start_md = 60
+    if end_md < start_md: end_md = start_md
+    if end_md > 60: end_md = 60
     league_doc = {
         "id": league_id,
         "name": league_name.strip() or f"Lega di {user['name']}",
@@ -545,6 +559,7 @@ async def create_league_for_user(user: dict, league_name: str, team_name: str, m
         "transfer_window_open": False,
         "kickoff_locked": False,
         "start_matchday": start_md,
+        "end_matchday": end_md,
         "created_at": now_iso(),
         "is_demo": False,
     }
@@ -631,12 +646,17 @@ async def register(data: UserRegister):
     elif data.action == "create":
         if not data.team_name:
             raise HTTPException(400, "Nome squadra richiesto")
+        start_md = data.start_matchday or 1
+        end_md = data.end_matchday or 38
+        if end_md < start_md:
+            raise HTTPException(400, "La giornata di fine deve essere ≥ giornata di inizio")
         await create_league_for_user(
             user_doc,
             data.league_name or f"Lega di {data.name}",
             data.team_name,
             data.mode or "asta",
-            data.start_matchday or 1,
+            start_md,
+            end_md,
         )
 
     return Token(access_token=make_token(uid),
@@ -796,7 +816,8 @@ class LeagueCreate(BaseModel):
     name: Optional[str] = None
     team_name: str = Field(min_length=1, max_length=48)
     mode: Optional[Literal["asta", "listino"]] = "asta"
-    start_matchday: Optional[int] = Field(default=1, ge=1, le=38)
+    start_matchday: int = Field(default=1, ge=1, le=60)
+    end_matchday: int = Field(default=38, ge=1, le=60)
 
 class LeagueJoin(BaseModel):
     code: str = Field(min_length=4, max_length=12)
@@ -804,10 +825,12 @@ class LeagueJoin(BaseModel):
 
 @api.post("/leagues/create", response_model=League)
 async def create_league(body: LeagueCreate, current=Depends(get_current_user)):
+    if body.end_matchday < body.start_matchday:
+        raise HTTPException(400, "La giornata di fine deve essere ≥ giornata di inizio")
     league = await create_league_for_user(
         current, body.name or f"Lega di {current['name']}",
         body.team_name, body.mode or "asta",
-        body.start_matchday or 1,
+        body.start_matchday, body.end_matchday,
     )
     return League(**league)
 
@@ -1438,7 +1461,8 @@ async def kickoff_unlock(league_id: str, current=Depends(get_current_user)):
 
 
 class LeagueSettingsUpdate(BaseModel):
-    start_matchday: Optional[int] = Field(default=None, ge=1, le=38)
+    start_matchday: Optional[int] = Field(default=None, ge=1, le=60)
+    end_matchday: Optional[int] = Field(default=None, ge=1, le=60)
     name: Optional[str] = Field(default=None, min_length=1, max_length=64)
 
 
@@ -1449,7 +1473,7 @@ async def update_league_settings(
     current=Depends(get_current_user),
 ):
     """Admin-only: update mutable league settings.
-    - `start_matchday`: only editable BEFORE kickoff is locked (regenerates fixtures).
+    - `start_matchday` / `end_matchday`: only editable BEFORE kickoff is locked (regenerates fixtures).
     - `name`: always editable by admin.
     """
     await require_admin(league_id, current)
@@ -1461,12 +1485,20 @@ async def update_league_settings(
     regenerate = False
     if body.name is not None:
         updates["name"] = body.name.strip()
-    if body.start_matchday is not None:
+    cur_start = int(league.get("start_matchday") or 1)
+    cur_end = int(league.get("end_matchday") or 38)
+    new_start = int(body.start_matchday) if body.start_matchday is not None else cur_start
+    new_end = int(body.end_matchday) if body.end_matchday is not None else cur_end
+    if new_end < new_start:
+        raise HTTPException(400, "La giornata di fine deve essere ≥ giornata di inizio")
+    if body.start_matchday is not None or body.end_matchday is not None:
         if league.get("kickoff_locked"):
-            raise HTTPException(400, "Non puoi cambiare la giornata di partenza dopo il kickoff")
-        new_md = int(body.start_matchday)
-        if new_md != int(league.get("start_matchday") or 1):
-            updates["start_matchday"] = new_md
+            raise HTTPException(400, "Non puoi cambiare l'intervallo giornate dopo il kickoff")
+        if new_start != cur_start:
+            updates["start_matchday"] = new_start
+            regenerate = True
+        if new_end != cur_end:
+            updates["end_matchday"] = new_end
             regenerate = True
 
     if updates:
@@ -1476,6 +1508,175 @@ async def update_league_settings(
 
     l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
     return League(**l)
+
+
+# ------------------------------------------------------------
+# Matchday kickoff scheduling + lineup persistence
+# ------------------------------------------------------------
+LINEUP_LOCK_MINUTES = 5  # lineups auto-lock N minutes before kickoff
+
+class KickoffScheduleIn(BaseModel):
+    matchday: int = Field(..., ge=1, le=60)
+    kickoff_at: Optional[str] = None  # ISO 8601. Pass null to clear.
+
+
+class LineupIn(BaseModel):
+    matchday: int = Field(..., ge=1, le=60)
+    formation: str = Field(..., min_length=3, max_length=16)
+    # 11 entries; each is a player_id or null when slot empty
+    starter_ids: List[Optional[str]] = Field(default_factory=list)
+
+
+class LineupOut(BaseModel):
+    league_id: str
+    user_id: str
+    matchday: int
+    formation: str
+    starter_ids: List[Optional[str]]
+    submitted_at: Optional[datetime] = None
+    locked: bool = False
+    lock_at: Optional[datetime] = None
+    kickoff_at: Optional[datetime] = None
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Support trailing 'Z'
+        if s.endswith("Z"):
+            s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _kickoff_for(league_doc: dict, matchday: int) -> Optional[datetime]:
+    return _parse_iso((league_doc.get("matchday_kickoffs") or {}).get(str(matchday)))
+
+
+def _lineup_locked(league_doc: dict, matchday: int, now: Optional[datetime] = None) -> Tuple[bool, Optional[datetime], Optional[datetime]]:
+    """Returns (locked, lock_at, kickoff_at) for the given matchday."""
+    now = now or datetime.now(timezone.utc)
+    ko = _kickoff_for(league_doc, matchday)
+    if not ko:
+        return False, None, None
+    lock_at = ko - timedelta(minutes=LINEUP_LOCK_MINUTES)
+    return (now >= lock_at), lock_at, ko
+
+
+@api.post("/leagues/{league_id}/kickoff/schedule", response_model=League)
+async def schedule_matchday_kickoff(
+    league_id: str,
+    body: KickoffScheduleIn,
+    current=Depends(get_current_user),
+):
+    """Admin-only: set (or clear) the scheduled kickoff datetime for a matchday.
+    Lineups will auto-lock 5 minutes before this timestamp for every league member.
+    Pass `kickoff_at: null` to clear the schedule."""
+    await require_admin(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not league:
+        raise HTTPException(404, "Lega non trovata")
+    start_md = int(league.get("start_matchday") or 1)
+    end_md = int(league.get("end_matchday") or 38)
+    if body.matchday < start_md or body.matchday > end_md:
+        raise HTTPException(400, f"Giornata fuori intervallo lega ({start_md}-{end_md})")
+
+    kickoffs = dict(league.get("matchday_kickoffs") or {})
+    if body.kickoff_at is None or body.kickoff_at == "":
+        kickoffs.pop(str(body.matchday), None)
+    else:
+        dt = _parse_iso(body.kickoff_at)
+        if not dt:
+            raise HTTPException(400, "Formato datetime kickoff non valido (usa ISO 8601)")
+        kickoffs[str(body.matchday)] = dt.isoformat()
+
+    await db.leagues.update_one(
+        {"id": league_id},
+        {"$set": {"matchday_kickoffs": kickoffs}},
+    )
+    l = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    return League(**l)
+
+
+@api.get("/leagues/{league_id}/lineup", response_model=LineupOut)
+async def get_my_lineup(
+    league_id: str,
+    matchday: int,
+    current=Depends(get_current_user),
+):
+    """Return the current user's saved lineup for a matchday + lock status."""
+    await require_membership(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not league:
+        raise HTTPException(404, "Lega non trovata")
+    doc = await db.lineups.find_one(
+        {"league_id": league_id, "user_id": current["id"], "matchday": matchday},
+        {"_id": 0},
+    )
+    locked, lock_at, ko = _lineup_locked(league, matchday)
+    if not doc:
+        return LineupOut(
+            league_id=league_id, user_id=current["id"], matchday=matchday,
+            formation="4-3-3", starter_ids=[], submitted_at=None,
+            locked=locked, lock_at=lock_at, kickoff_at=ko,
+        )
+    return LineupOut(
+        league_id=league_id,
+        user_id=current["id"],
+        matchday=matchday,
+        formation=doc.get("formation") or "4-3-3",
+        starter_ids=doc.get("starter_ids") or [],
+        submitted_at=doc.get("submitted_at"),
+        locked=locked, lock_at=lock_at, kickoff_at=ko,
+    )
+
+
+@api.put("/leagues/{league_id}/lineup", response_model=LineupOut)
+async def save_my_lineup(
+    league_id: str,
+    body: LineupIn,
+    current=Depends(get_current_user),
+):
+    """Save the current user's lineup for a matchday. Rejected if lineup is locked."""
+    await require_membership(league_id, current)
+    league = await db.leagues.find_one({"id": league_id}, {"_id": 0})
+    if not league:
+        raise HTTPException(404, "Lega non trovata")
+    start_md = int(league.get("start_matchday") or 1)
+    end_md = int(league.get("end_matchday") or 38)
+    if body.matchday < start_md or body.matchday > end_md:
+        raise HTTPException(400, f"Giornata fuori intervallo lega ({start_md}-{end_md})")
+    locked, lock_at, ko = _lineup_locked(league, body.matchday)
+    if locked:
+        raise HTTPException(
+            423, f"Formazione bloccata: il salvataggio chiude 5 minuti prima del kickoff"
+        )
+    # Sanitize starter_ids: keep <= 20 entries, allow null placeholders
+    starter_ids = [x if (x is None or isinstance(x, str)) else None for x in (body.starter_ids or [])][:20]
+    now = datetime.now(timezone.utc)
+    await db.lineups.update_one(
+        {"league_id": league_id, "user_id": current["id"], "matchday": body.matchday},
+        {"$set": {
+            "league_id": league_id,
+            "user_id": current["id"],
+            "matchday": body.matchday,
+            "formation": body.formation,
+            "starter_ids": starter_ids,
+            "submitted_at": now,
+        }},
+        upsert=True,
+    )
+    return LineupOut(
+        league_id=league_id, user_id=current["id"], matchday=body.matchday,
+        formation=body.formation, starter_ids=starter_ids, submitted_at=now,
+        locked=locked, lock_at=lock_at, kickoff_at=ko,
+    )
+
 
 
 @api.get("/leagues/{league_id}/free-agents", response_model=List[Player])
@@ -1881,7 +2082,7 @@ async def upload_ratings_manual(
 ):
     """Admin uploads a list of player ratings for a specific matchday."""
     await require_admin(league_id, current)
-    if matchday < 1 or matchday > 38:
+    if matchday < 1 or matchday > 60:
         raise HTTPException(400, "Giornata non valida")
     if not body.ratings:
         raise HTTPException(400, "Lista voti vuota")
@@ -1924,7 +2125,7 @@ async def generate_mock_ratings(
 ):
     """Generate smart mock ratings for every player owned by any manager in this league."""
     await require_admin(league_id, current)
-    if matchday < 1 or matchday > 38:
+    if matchday < 1 or matchday > 60:
         raise HTTPException(400, "Giornata non valida")
 
     # collect all player_ids from all rosters in this league
@@ -2050,7 +2251,7 @@ async def settle_matchday(
 ):
     """Compute fantavoto per manager (with bench subs), update fixtures & standings."""
     await require_admin(league_id, current)
-    if matchday < 1 or matchday > 38:
+    if matchday < 1 or matchday > 60:
         raise HTTPException(400, "Giornata non valida")
 
     ratings_map = await _load_ratings_map(league_id, matchday)
@@ -2286,13 +2487,16 @@ async def dashboard(league_id: str, current=Depends(get_current_user)):
     )
     start_md = int(l.get("start_matchday") or 1)
     next_md = int((first_fixture or {}).get("matchday") or start_md)
+    # Use scheduled kickoff if admin has set one for this matchday, else a soft placeholder.
+    scheduled = _kickoff_for(l, next_md)
+    next_kickoff = scheduled if scheduled else (datetime.now(timezone.utc) + timedelta(days=2, hours=3))
     return DashboardSummary(
         league=League(**l),
         my_team_name=team_name,
         rank=rank,
         points=points,
         next_matchday=next_md,
-        next_kickoff=datetime.now(timezone.utc) + timedelta(days=2, hours=3),
+        next_kickoff=next_kickoff,
         members=len(l.get("member_ids", [])),
     )
 
@@ -2427,6 +2631,7 @@ async def seed():
             "transfer_window_open": False,
             "kickoff_locked": False,
             "start_matchday": 1,
+            "end_matchday": 38,
             "created_at": now_iso(),
             "is_demo": True,
         })

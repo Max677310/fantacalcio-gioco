@@ -33,6 +33,7 @@ export type RegisterPayload = {
   league_name?: string;
   mode?: 'asta' | 'listino';
   start_matchday?: number;
+  end_matchday?: number;
 };
 
 export const api = {
@@ -46,14 +47,26 @@ export const api = {
   resetPassword: (email: string, code: string, new_password: string) =>
     request<any>('/auth/reset-password', { method: 'POST', body: JSON.stringify({ email, code, new_password }) }),
   myLeagues: () => request<any[]>('/leagues/mine'),
-  createLeague: (name: string, team_name: string, mode: 'asta' | 'listino' = 'asta', start_matchday: number = 1) =>
-    request<any>('/leagues/create', { method: 'POST', body: JSON.stringify({ name, team_name, mode, start_matchday }) }),
-  updateLeagueSettings: (leagueId: string, body: { start_matchday?: number; name?: string }) =>
+  createLeague: (name: string, team_name: string, mode: 'asta' | 'listino' = 'asta', start_matchday: number = 1, end_matchday: number = 38) =>
+    request<any>('/leagues/create', { method: 'POST', body: JSON.stringify({ name, team_name, mode, start_matchday, end_matchday }) }),
+  updateLeagueSettings: (leagueId: string, body: { start_matchday?: number; end_matchday?: number; name?: string }) =>
     request<any>(`/leagues/${leagueId}/settings`, { method: 'PATCH', body: JSON.stringify(body) }),
   kickoffLock: (leagueId: string) =>
     request<any>(`/leagues/${leagueId}/kickoff/lock`, { method: 'POST' }),
   kickoffUnlock: (leagueId: string) =>
     request<any>(`/leagues/${leagueId}/kickoff/unlock`, { method: 'POST' }),
+  scheduleKickoff: (leagueId: string, matchday: number, kickoffAt: string | null) =>
+    request<any>(`/leagues/${leagueId}/kickoff/schedule`, {
+      method: 'POST',
+      body: JSON.stringify({ matchday, kickoff_at: kickoffAt }),
+    }),
+  getLineup: (leagueId: string, matchday: number) =>
+    request<any>(`/leagues/${leagueId}/lineup?matchday=${matchday}`),
+  saveLineup: (leagueId: string, matchday: number, formation: string, starter_ids: (string | null)[]) =>
+    request<any>(`/leagues/${leagueId}/lineup`, {
+      method: 'PUT',
+      body: JSON.stringify({ matchday, formation, starter_ids }),
+    }),
   joinLeague: (code: string, team_name: string) =>
     request<any>('/leagues/join', { method: 'POST', body: JSON.stringify({ code, team_name }) }),
   leagueMembers: (leagueId: string) => request<any[]>(`/leagues/${leagueId}/members`),

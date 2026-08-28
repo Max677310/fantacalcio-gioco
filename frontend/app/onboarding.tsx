@@ -25,6 +25,7 @@ export default function Onboarding() {
   const [teamName, setTeamName] = useState('');
   const [leagueName, setLeagueName] = useState('');
   const [startMatchday, setStartMatchday] = useState<number>(1);
+  const [endMatchday, setEndMatchday] = useState<number>(38);
   const [code, setCode] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -32,11 +33,14 @@ export default function Onboarding() {
   const submit = async () => {
     setError(null);
     if (!teamName.trim()) { setError('Inserisci il nome della squadra'); return; }
+    if (mode === 'create' && endMatchday < startMatchday) {
+      setError('La giornata di fine deve essere ≥ giornata di inizio'); return;
+    }
     if (mode === 'join' && code.trim().length < 4) { setError('Codice invito non valido'); return; }
     setLoading(true);
     try {
       if (mode === 'create') {
-        await api.createLeague(leagueName.trim() || `Lega di ${user?.name}`, teamName.trim(), leagueMode, startMatchday);
+        await api.createLeague(leagueName.trim() || `Lega di ${user?.name}`, teamName.trim(), leagueMode, startMatchday, endMatchday);
       } else {
         await api.joinLeague(code.trim(), teamName.trim());
       }
@@ -147,43 +151,90 @@ export default function Onboarding() {
                     <View style={styles.matchdayBlock}>
                       <View style={styles.matchdayHead}>
                         <Ionicons name="calendar" size={16} color={theme.colors.brandSecondary} />
-                        <Text style={styles.matchdayLabel}>Giornata di partenza</Text>
+                        <Text style={styles.matchdayLabel}>Intervallo giornate</Text>
                         <View style={styles.matchdayValue}>
-                          <Text style={styles.matchdayValueText}>{startMatchday}ª</Text>
+                          <Text style={styles.matchdayValueText}>{startMatchday}ª → {endMatchday}ª</Text>
                         </View>
                       </View>
                       <Text style={styles.matchdayHelp}>
-                        Da quale giornata di Serie A la lega inizia a tracciare i punteggi.
+                        Definisci l&apos;intervallo del tuo campionato personalizzato: inizio e fine (max 60ª).
                       </Text>
-                      <View style={styles.matchdayControls}>
-                        <Pressable
-                          testID="matchday-dec"
-                          onPress={() => setStartMatchday((v) => Math.max(1, v - 1))}
-                          style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
-                          hitSlop={6}
-                        >
-                          <Ionicons name="remove" size={20} color={theme.colors.onSurface} />
-                        </Pressable>
-                        <View style={styles.mdSlider}>
-                          {[1, 5, 10, 15, 20, 25, 30, 35, 38].map((n) => (
-                            <Pressable
-                              key={n}
-                              testID={`matchday-quick-${n}`}
-                              onPress={() => setStartMatchday(n)}
-                              style={[styles.mdChip, startMatchday === n && styles.mdChipActive]}
-                            >
-                              <Text style={[styles.mdChipText, startMatchday === n && styles.mdChipTextActive]}>{n}</Text>
-                            </Pressable>
-                          ))}
+
+                      {/* Giornata di INIZIO */}
+                      <View style={styles.mdSection}>
+                        <Text style={styles.mdSectionLabel}>Inizio</Text>
+                        <View style={styles.matchdayControls}>
+                          <Pressable
+                            testID="matchday-start-dec"
+                            onPress={() => setStartMatchday((v) => Math.max(1, v - 1))}
+                            style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="remove" size={20} color={theme.colors.onSurface} />
+                          </Pressable>
+                          <View style={styles.mdSlider}>
+                            {[1, 5, 10, 15, 20, 25, 30, 35, 38].map((n) => (
+                              <Pressable
+                                key={`s-${n}`}
+                                testID={`matchday-start-quick-${n}`}
+                                onPress={() => setStartMatchday(n)}
+                                style={[styles.mdChip, startMatchday === n && styles.mdChipActive]}
+                              >
+                                <Text style={[styles.mdChipText, startMatchday === n && styles.mdChipTextActive]}>{n}</Text>
+                              </Pressable>
+                            ))}
+                          </View>
+                          <Pressable
+                            testID="matchday-start-inc"
+                            onPress={() => setStartMatchday((v) => Math.min(60, v + 1))}
+                            style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="add" size={20} color={theme.colors.onSurface} />
+                          </Pressable>
                         </View>
-                        <Pressable
-                          testID="matchday-inc"
-                          onPress={() => setStartMatchday((v) => Math.min(38, v + 1))}
-                          style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
-                          hitSlop={6}
-                        >
-                          <Ionicons name="add" size={20} color={theme.colors.onSurface} />
-                        </Pressable>
+                      </View>
+
+                      {/* Giornata di FINE */}
+                      <View style={styles.mdSection}>
+                        <Text style={styles.mdSectionLabel}>Fine</Text>
+                        <View style={styles.matchdayControls}>
+                          <Pressable
+                            testID="matchday-end-dec"
+                            onPress={() => setEndMatchday((v) => Math.max(startMatchday, v - 1))}
+                            style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="remove" size={20} color={theme.colors.onSurface} />
+                          </Pressable>
+                          <View style={styles.mdSlider}>
+                            {[5, 10, 15, 20, 25, 30, 34, 38, 45].map((n) => (
+                              <Pressable
+                                key={`e-${n}`}
+                                testID={`matchday-end-quick-${n}`}
+                                onPress={() => setEndMatchday(Math.max(startMatchday, n))}
+                                style={[styles.mdChip, endMatchday === n && styles.mdChipActive]}
+                              >
+                                <Text style={[styles.mdChipText, endMatchday === n && styles.mdChipTextActive]}>{n}</Text>
+                              </Pressable>
+                            ))}
+                          </View>
+                          <Pressable
+                            testID="matchday-end-inc"
+                            onPress={() => setEndMatchday((v) => Math.min(60, v + 1))}
+                            style={({ pressed }) => [styles.mdBtn, pressed && { opacity: 0.7 }]}
+                            hitSlop={6}
+                          >
+                            <Ionicons name="add" size={20} color={theme.colors.onSurface} />
+                          </Pressable>
+                        </View>
+                      </View>
+
+                      <View style={styles.mdSummaryRow}>
+                        <Ionicons name="stats-chart" size={13} color={theme.colors.onSurfaceSecondary} />
+                        <Text style={styles.mdSummaryText}>
+                          {Math.max(0, endMatchday - startMatchday + 1)} giornate totali
+                        </Text>
                       </View>
                     </View>
                   </>
@@ -325,4 +376,14 @@ const styles = StyleSheet.create({
   },
   mdChipText: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '700' },
   mdChipTextActive: { color: theme.colors.onBrandSecondary, fontWeight: '800' },
+  mdSection: { marginTop: 10 },
+  mdSectionLabel: {
+    color: theme.colors.brandSecondary, fontSize: 10, fontWeight: '800',
+    letterSpacing: 1.2, textTransform: 'uppercase', marginBottom: 6,
+  },
+  mdSummaryRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 10, justifyContent: 'center',
+    paddingTop: 8, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)',
+  },
+  mdSummaryText: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '600' },
 });

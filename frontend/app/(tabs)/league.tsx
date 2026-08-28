@@ -23,14 +23,29 @@ export default function LeagueTab() {
   const [refreshing, setRefreshing] = useState(false);
   const [copied, setCopied] = useState(false);
   const [showMdModal, setShowMdModal] = useState(false);
-  const [pendingMd, setPendingMd] = useState<number>(1);
+  const [pendingStart, setPendingStart] = useState<number>(1);
+  const [pendingEnd, setPendingEnd] = useState<number>(38);
   const [savingMd, setSavingMd] = useState(false);
+  // Kickoff scheduling
+  const [showKickoffModal, setShowKickoffModal] = useState(false);
+  const [nextMatchday, setNextMatchday] = useState<number | null>(null);
+  const [scheduledKickoff, setScheduledKickoff] = useState<Date | null>(null);
+  const [savingKickoff, setSavingKickoff] = useState(false);
+  const [pendingKickoff, setPendingKickoff] = useState<Date | null>(null);
 
   const load = useCallback(async () => {
     if (!league) return;
     try {
-      const m = await api.leagueMembers(league.id);
+      const [m, dash] = await Promise.all([
+        api.leagueMembers(league.id),
+        api.dashboard(league.id).catch(() => null),
+      ]);
       setMembers(m);
+      const md = dash?.next_matchday || league.start_matchday || 1;
+      setNextMatchday(md);
+      const kickoffs = (league as any).matchday_kickoffs || {};
+      const iso = kickoffs[String(md)];
+      setScheduledKickoff(iso ? new Date(iso) : null);
     } finally {
       setLoading(false); setRefreshing(false);
     }
@@ -64,26 +79,78 @@ export default function LeagueTab() {
 
   const isAdmin = league.admin_id === user?.id;
   const startMatchday: number = (league as any).start_matchday || 1;
+  const endMatchday: number = (league as any).end_matchday || 38;
   const kickoffLocked: boolean = !!(league as any).kickoff_locked;
   const canEditMd = isAdmin && !kickoffLocked;
 
   const openMdModal = () => {
-    setPendingMd(startMatchday);
+    setPendingStart(startMatchday);
+    setPendingEnd(endMatchday);
     setShowMdModal(true);
   };
 
   const saveMd = async () => {
     if (!league) return;
-    if (pendingMd === startMatchday) { setShowMdModal(false); return; }
+    if (pendingEnd < pendingStart) {
+      Alert.alert('Errore', 'La giornata di fine deve essere ≥ giornata di inizio');
+      return;
+    }
+    const noChange = pendingStart === startMatchday && pendingEnd === endMatchday;
+    if (noChange) { setShowMdModal(false); return; }
     setSavingMd(true);
     try {
-      await api.updateLeagueSettings(league.id, { start_matchday: pendingMd });
+      const body: any = {};
+      if (pendingStart !== startMatchday) body.start_matchday = pendingStart;
+      if (pendingEnd !== endMatchday) body.end_matchday = pendingEnd;
+      await api.updateLeagueSettings(league.id, body);
       await refresh();
       setShowMdModal(false);
     } catch (e: any) {
-      Alert.alert('Errore', e?.message || 'Impossibile aggiornare la giornata di partenza');
+      Alert.alert('Errore', e?.message || 'Impossibile aggiornare le giornate');
     } finally {
       setSavingMd(false);
+    }
+  };
+
+  const openKickoffModal = () => {
+    setPendingKickoff(scheduledKickoff);
+    setShowKickoffModal(true);
+  };
+  const applyPreset = (mins: number) => {
+    setPendingKickoff(new Date(Date.now() + mins * 60000));
+  };
+  const shiftPendingKickoff = (deltaMinutes: number) => {
+    const base = pendingKickoff || new Date(Date.now() + 60 * 60000);
+    setPendingKickoff(new Date(base.getTime() + deltaMinutes * 60000));
+  };
+  const saveKickoff = async () => {
+    if (!league || !nextMatchday) return;
+    setSavingKickoff(true);
+    try {
+      const iso = pendingKickoff ? pendingKickoff.toISOString() : null;
+      await api.scheduleKickoff(league.id, nextMatchday, iso);
+      setScheduledKickoff(pendingKickoff);
+      await refresh();
+      setShowKickoffModal(false);
+    } catch (e: any) {
+      Alert.alert('Errore', e?.message || 'Impossibile salvare il kickoff');
+    } finally {
+      setSavingKickoff(false);
+    }
+  };
+  const clearKickoff = async () => {
+    if (!league || !nextMatchday) return;
+    setSavingKickoff(true);
+    try {
+      await api.scheduleKickoff(league.id, nextMatchday, null);
+      setScheduledKickoff(null);
+      setPendingKickoff(null);
+      await refresh();
+      setShowKickoffModal(false);
+    } catch (e: any) {
+      Alert.alert('Errore', e?.message || 'Impossibile rimuovere il kickoff');
+    } finally {
+      setSavingKickoff(false);
     }
   };
 
@@ -149,15 +216,17 @@ export default function LeagueTab() {
               <Ionicons name="calendar" size={18} color={theme.colors.brandSecondary} />
             </View>
             <View style={{ flex: 1 }}>
-              <Text style={styles.settingsLabel}>Giornata di partenza</Text>
+              <Text style={styles.settingsLabel}>Intervallo giornate</Text>
               <Text style={styles.settingsSub}>
                 {kickoffLocked
-                  ? 'Bloccata dopo il kickoff'
-                  : (canEditMd ? 'La lega inizia dalla giornata selezionata' : 'Solo l\'admin può modificarla')}
+                  ? 'Bloccato dopo il kickoff'
+                  : (canEditMd
+                    ? `${endMatchday - startMatchday + 1} giornate · ${startMatchday}ª → ${endMatchday}ª`
+                    : 'Solo l\'admin può modificarlo')}
               </Text>
             </View>
             <View style={styles.mdBadge}>
-              <Text style={styles.mdBadgeText}>{startMatchday}ª</Text>
+              <Text style={styles.mdBadgeText}>{startMatchday}→{endMatchday}</Text>
             </View>
             {canEditMd && (
               <Pressable testID="edit-start-md" onPress={openMdModal} hitSlop={10} style={styles.editBtn}>
@@ -166,6 +235,32 @@ export default function LeagueTab() {
             )}
           </View>
         </View>
+
+        {isAdmin && (
+          <View style={styles.settingsCard} testID="kickoff-card">
+            <View style={styles.settingsRow}>
+              <View style={[styles.settingsIcon, { backgroundColor: 'rgba(245,158,11,0.12)', borderColor: 'rgba(245,158,11,0.35)' }]}>
+                <Ionicons name="alarm" size={18} color={theme.colors.warning} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.settingsLabel}>Kickoff giornata {nextMatchday ?? '—'}</Text>
+                <Text style={styles.settingsSub}>
+                  {scheduledKickoff
+                    ? `${scheduledKickoff.toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })} · blocco formazioni 5 min prima`
+                    : 'Non programmato — le formazioni non si bloccano'}
+                </Text>
+              </View>
+              <Pressable
+                testID="edit-kickoff"
+                onPress={openKickoffModal}
+                hitSlop={10}
+                style={styles.editBtn}
+              >
+                <Ionicons name={scheduledKickoff ? 'create-outline' : 'add-circle-outline'} size={20} color={theme.colors.brandSecondary} />
+              </Pressable>
+            </View>
+          </View>
+        )}
 
         {isAdmin && (
           <Pressable
@@ -225,7 +320,7 @@ export default function LeagueTab() {
         </View>
       </ScrollView>
 
-      {/* Start Matchday Modal */}
+      {/* Start / End Matchday Modal */}
       <Modal
         visible={showMdModal}
         transparent
@@ -236,48 +331,91 @@ export default function LeagueTab() {
           <Pressable style={styles.modalCard} onPress={() => {}}>
             <View style={styles.modalHead}>
               <Ionicons name="calendar" size={20} color={theme.colors.brandSecondary} />
-              <Text style={styles.modalTitle}>Giornata di partenza</Text>
+              <Text style={styles.modalTitle}>Intervallo giornate</Text>
             </View>
             <Text style={styles.modalSub}>
-              Scegli da quale giornata di Serie A la tua lega inizia a tracciare i punteggi (1-38).
+              Definisci l&apos;intervallo del tuo campionato personalizzato. Il calendario sarà rigenerato.
             </Text>
 
+            {/* INIZIO */}
+            <Text style={styles.mdRangeLabel}>Giornata di inizio</Text>
             <View style={styles.mdBigRow}>
               <Pressable
-                testID="modal-md-dec"
-                onPress={() => setPendingMd((v) => Math.max(1, v - 1))}
+                testID="modal-start-dec"
+                onPress={() => setPendingStart((v) => Math.max(1, v - 1))}
                 style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
               >
                 <Ionicons name="remove" size={26} color={theme.colors.onSurface} />
               </Pressable>
               <View style={styles.mdBigValueWrap}>
-                <Text style={styles.mdBigValue}>{pendingMd}</Text>
-                <Text style={styles.mdBigLabel}>giornata</Text>
+                <Text style={styles.mdBigValue}>{pendingStart}</Text>
+                <Text style={styles.mdBigLabel}>inizio</Text>
               </View>
               <Pressable
-                testID="modal-md-inc"
-                onPress={() => setPendingMd((v) => Math.min(38, v + 1))}
+                testID="modal-start-inc"
+                onPress={() => setPendingStart((v) => Math.min(60, v + 1))}
                 style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
               >
                 <Ionicons name="add" size={26} color={theme.colors.onSurface} />
               </Pressable>
             </View>
-
             <View style={styles.mdQuickRow}>
               {[1, 5, 10, 15, 20, 25, 30, 35, 38].map((n) => (
                 <Pressable
-                  key={n}
-                  testID={`modal-md-quick-${n}`}
-                  onPress={() => setPendingMd(n)}
-                  style={[styles.mdChip, pendingMd === n && styles.mdChipActive]}
+                  key={`s-${n}`}
+                  testID={`modal-start-quick-${n}`}
+                  onPress={() => setPendingStart(n)}
+                  style={[styles.mdChip, pendingStart === n && styles.mdChipActive]}
                 >
-                  <Text style={[styles.mdChipText, pendingMd === n && styles.mdChipTextActive]}>{n}</Text>
+                  <Text style={[styles.mdChipText, pendingStart === n && styles.mdChipTextActive]}>{n}</Text>
                 </Pressable>
               ))}
             </View>
 
+            {/* FINE */}
+            <Text style={styles.mdRangeLabel}>Giornata di fine</Text>
+            <View style={styles.mdBigRow}>
+              <Pressable
+                testID="modal-end-dec"
+                onPress={() => setPendingEnd((v) => Math.max(pendingStart, v - 1))}
+                style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
+              >
+                <Ionicons name="remove" size={26} color={theme.colors.onSurface} />
+              </Pressable>
+              <View style={styles.mdBigValueWrap}>
+                <Text style={styles.mdBigValue}>{pendingEnd}</Text>
+                <Text style={styles.mdBigLabel}>fine</Text>
+              </View>
+              <Pressable
+                testID="modal-end-inc"
+                onPress={() => setPendingEnd((v) => Math.min(60, v + 1))}
+                style={({ pressed }) => [styles.mdBigBtn, pressed && { opacity: 0.7 }]}
+              >
+                <Ionicons name="add" size={26} color={theme.colors.onSurface} />
+              </Pressable>
+            </View>
+            <View style={styles.mdQuickRow}>
+              {[5, 10, 15, 20, 25, 30, 34, 38, 45].map((n) => (
+                <Pressable
+                  key={`e-${n}`}
+                  testID={`modal-end-quick-${n}`}
+                  onPress={() => setPendingEnd(Math.max(pendingStart, n))}
+                  style={[styles.mdChip, pendingEnd === n && styles.mdChipActive]}
+                >
+                  <Text style={[styles.mdChipText, pendingEnd === n && styles.mdChipTextActive]}>{n}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.mdTotalRow}>
+              <Ionicons name="stats-chart" size={14} color={theme.colors.brandSecondary} />
+              <Text style={styles.mdTotalText}>
+                {Math.max(0, pendingEnd - pendingStart + 1)} giornate totali
+              </Text>
+            </View>
+
             <Text style={styles.mdWarning}>
-              ⚠️ Cambiando la giornata verrà rigenerato il calendario partite.
+              ⚠️ Cambiando l&apos;intervallo verrà rigenerato il calendario partite.
             </Text>
 
             <View style={styles.modalBtnRow}>
@@ -296,6 +434,111 @@ export default function LeagueTab() {
                 disabled={savingMd}
               >
                 {savingMd
+                  ? <ActivityIndicator color={theme.colors.onBrandSecondary} />
+                  : <Text style={styles.modalBtnPrimaryText}>Salva</Text>}
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* Kickoff schedule modal */}
+      <Modal
+        visible={showKickoffModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setShowKickoffModal(false)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => !savingKickoff && setShowKickoffModal(false)}>
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <View style={styles.modalHead}>
+              <Ionicons name="alarm" size={22} color={theme.colors.warning} />
+              <Text style={styles.modalTitle}>Programma kickoff</Text>
+            </View>
+            <Text style={styles.modalSub}>
+              Giornata {nextMatchday ?? '—'} — le formazioni si bloccheranno automaticamente 5 minuti prima.
+            </Text>
+
+            <View style={styles.kickoffPreview}>
+              <Ionicons name="time" size={18} color={theme.colors.brandSecondary} />
+              <Text style={styles.kickoffPreviewText}>
+                {pendingKickoff
+                  ? pendingKickoff.toLocaleString('it-IT', { weekday: 'short', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })
+                  : 'Nessun orario impostato'}
+              </Text>
+            </View>
+
+            <Text style={styles.mdRangeLabel}>Preset rapidi</Text>
+            <View style={styles.mdQuickRow}>
+              {[
+                { m: 60, l: '+1h' },
+                { m: 60 * 3, l: '+3h' },
+                { m: 60 * 6, l: '+6h' },
+                { m: 60 * 24, l: 'Domani' },
+                { m: 60 * 24 * 2, l: '+2g' },
+                { m: 60 * 24 * 7, l: '+1sett' },
+              ].map((p) => (
+                <Pressable
+                  key={p.l}
+                  testID={`kickoff-preset-${p.l}`}
+                  onPress={() => applyPreset(p.m)}
+                  style={styles.mdChip}
+                >
+                  <Text style={styles.mdChipText}>{p.l}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <Text style={styles.mdRangeLabel}>Regolazione fine</Text>
+            <View style={styles.kickoffTuneRow}>
+              {[
+                { d: -60 * 24, l: '-1g' },
+                { d: -60, l: '-1h' },
+                { d: -15, l: '-15m' },
+                { d: -5, l: '-5m' },
+                { d: 5, l: '+5m' },
+                { d: 15, l: '+15m' },
+                { d: 60, l: '+1h' },
+                { d: 60 * 24, l: '+1g' },
+              ].map((t) => (
+                <Pressable
+                  key={t.l}
+                  testID={`kickoff-tune-${t.l}`}
+                  onPress={() => shiftPendingKickoff(t.d)}
+                  disabled={!pendingKickoff}
+                  style={[styles.mdChip, !pendingKickoff && { opacity: 0.4 }]}
+                >
+                  <Text style={styles.mdChipText}>{t.l}</Text>
+                </Pressable>
+              ))}
+            </View>
+
+            <View style={styles.modalBtnRow}>
+              {scheduledKickoff && (
+                <Pressable
+                  testID="kickoff-clear"
+                  onPress={clearKickoff}
+                  style={[styles.modalBtn, styles.modalBtnGhost, { flex: 0.6 }]}
+                  disabled={savingKickoff}
+                >
+                  <Text style={[styles.modalBtnGhostText, { color: theme.colors.error }]}>Rimuovi</Text>
+                </Pressable>
+              )}
+              <Pressable
+                testID="kickoff-cancel"
+                onPress={() => setShowKickoffModal(false)}
+                style={[styles.modalBtn, styles.modalBtnGhost]}
+                disabled={savingKickoff}
+              >
+                <Text style={styles.modalBtnGhostText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                testID="kickoff-save"
+                onPress={saveKickoff}
+                disabled={savingKickoff || !pendingKickoff}
+                style={[styles.modalBtn, styles.modalBtnPrimary, (savingKickoff || !pendingKickoff) && { opacity: 0.6 }]}
+              >
+                {savingKickoff
                   ? <ActivityIndicator color={theme.colors.onBrandSecondary} />
                   : <Text style={styles.modalBtnPrimaryText}>Salva</Text>}
               </Pressable>
@@ -448,10 +691,34 @@ const styles = StyleSheet.create({
   mdChipText: { color: theme.colors.onSurfaceSecondary, fontSize: 12, fontWeight: '700' },
   mdChipTextActive: { color: theme.colors.onBrandSecondary, fontWeight: '800' },
   mdWarning: { color: theme.colors.onSurfaceSecondary, fontSize: 11, textAlign: 'center', marginBottom: theme.spacing.md, lineHeight: 15 },
+  mdRangeLabel: {
+    color: theme.colors.brandSecondary, fontSize: 11, fontWeight: '800',
+    letterSpacing: 1.2, textTransform: 'uppercase',
+    marginTop: theme.spacing.sm, marginBottom: 6,
+  },
+  mdTotalRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    justifyContent: 'center', marginTop: 4, marginBottom: 8,
+    paddingVertical: 6,
+    backgroundColor: 'rgba(212,175,55,0.08)',
+    borderRadius: theme.radius.pill,
+  },
+  mdTotalText: { color: theme.colors.brandSecondary, fontSize: 12, fontWeight: '800' },
   modalBtnRow: { flexDirection: 'row', gap: 10 },
   modalBtn: { flex: 1, paddingVertical: 12, borderRadius: theme.radius.md, alignItems: 'center', justifyContent: 'center' },
   modalBtnGhost: { backgroundColor: theme.colors.surfaceTertiary, borderWidth: 1, borderColor: theme.colors.border },
   modalBtnGhostText: { color: theme.colors.onSurface, fontWeight: '700', fontSize: 14 },
   modalBtnPrimary: { backgroundColor: theme.colors.brandSecondary },
   modalBtnPrimaryText: { color: theme.colors.onBrandSecondary, fontWeight: '800', fontSize: 14 },
+
+  kickoffPreview: {
+    flexDirection: 'row', alignItems: 'center', gap: 10,
+    padding: theme.spacing.md,
+    borderRadius: theme.radius.md,
+    backgroundColor: 'rgba(212,175,55,0.10)',
+    borderWidth: 1, borderColor: 'rgba(212,175,55,0.35)',
+    marginBottom: theme.spacing.md,
+  },
+  kickoffPreviewText: { color: theme.colors.onSurface, fontSize: 14, fontWeight: '700', flex: 1 },
+  kickoffTuneRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: theme.spacing.md },
 });

@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import {
   View, Text, StyleSheet, ScrollView, Pressable, Modal,
-  ActivityIndicator, useWindowDimensions,
+  ActivityIndicator, useWindowDimensions, TextInput,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useRouter } from 'expo-router';
@@ -70,6 +70,19 @@ const FORMATIONS: Record<string, Slot[]> = {
 
 const FORMATION_KEYS = ['4-3-3', '3-4-3', '3-5-2', '4-4-2', '4-5-1', '5-3-2', '5-4-1'] as const;
 
+function formatCountdown(ms: number): string {
+  if (ms <= 0) return '0s';
+  const total = Math.floor(ms / 1000);
+  const d = Math.floor(total / 86400);
+  const h = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (d > 0) return `${d}g ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+
 export default function Lineup() {
   const router = useRouter();
   const { user } = useAuth();
@@ -81,12 +94,24 @@ export default function Lineup() {
   // starterIds[i] = player_id assigned to slot i (11 entries)
   const [starterIds, setStarterIds] = useState<(string | null)[]>([]);
   const [loading, setLoading] = useState(true);
+  // Current matchday + kickoff lock
+  const [matchday, setMatchday] = useState<number | null>(null);
+  const [kickoffAt, setKickoffAt] = useState<Date | null>(null);
+  const [lockAt, setLockAt] = useState<Date | null>(null);
+  const [now, setNow] = useState<number>(Date.now());
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [savedSnapshot, setSavedSnapshot] = useState<string>('');
+  const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lineupHydrated = useRef(false);
   // Bottom sheet state
   const [sheetOpen, setSheetOpen] = useState(false);
   const [sheetSlot, setSheetSlot] = useState<number | null>(null); // index of slot being replaced
   const [sheetMode, setSheetMode] = useState<'sub' | 'browse'>('sub'); // 'browse' = show full bench
+  const [benchQuery, setBenchQuery] = useState('');
 
   const slots = FORMATIONS[formation];
+  const isLocked = !!(lockAt && now >= lockAt.getTime());
 
   // Load user's roster
   const loadRoster = useCallback(async () => {
@@ -106,6 +131,63 @@ export default function Lineup() {
 
   useEffect(() => { loadRoster(); }, [loadRoster]);
 
+  // Bootstrap current matchday from dashboard, then fetch saved lineup + kickoff/lock info
+  const kickoffsKey = JSON.stringify((league as any)?.matchday_kickoffs || {});
+  useEffect(() => {
+    if (!league) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const dash = await api.dashboard(league.id).catch(() => null);
+        const md = dash?.next_matchday || league.start_matchday || 1;
+        if (cancelled) return;
+        setMatchday(md);
+        const lu = await api.getLineup(league.id, md).catch(() => null);
+        if (cancelled || !lu) return;
+        setKickoffAt(lu.kickoff_at ? new Date(lu.kickoff_at) : null);
+        setLockAt(lu.lock_at ? new Date(lu.lock_at) : null);
+        // Hydrate saved formation
+        if (lu.formation && FORMATIONS[lu.formation]) setFormation(lu.formation);
+        // Only hydrate starter_ids if they look sensible (must have ANY id)
+        const hasAnyId = Array.isArray(lu.starter_ids) && lu.starter_ids.some((x: any) => !!x);
+        if (hasAnyId) {
+          setStarterIds(lu.starter_ids);
+          setSavedSnapshot(JSON.stringify({ formation: lu.formation, starter_ids: lu.starter_ids }));
+        }
+      } catch { /* ignore */ }
+      finally { lineupHydrated.current = true; }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [league?.id, kickoffsKey]);
+
+  // Tick every 5s so lock banner + countdown update
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(t);
+  }, []);
+
+  // Auto-save lineup (debounced) whenever formation or starterIds change (after hydration)
+  useEffect(() => {
+    if (!league || !matchday || !lineupHydrated.current || isLocked) return;
+    if (starterIds.length === 0) return;
+    const payload = JSON.stringify({ formation, starter_ids: starterIds });
+    if (payload === savedSnapshot) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        setSaveState('saving'); setSaveError(null);
+        await api.saveLineup(league.id, matchday, formation, starterIds);
+        setSavedSnapshot(payload);
+        setSaveState('saved');
+      } catch (e: any) {
+        setSaveState('error');
+        setSaveError(e?.message || 'Errore salvataggio');
+      }
+    }, 700);
+    return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
+  }, [formation, starterIds, league, matchday, savedSnapshot, isLocked]);
+
   // Group roster by role
   const rosterByRole: Record<SlotRole, P[]> = useMemo(() => {
     const out: Record<SlotRole, P[]> = { P: [], D: [], C: [], A: [] };
@@ -118,8 +200,30 @@ export default function Lineup() {
   }, [roster]);
 
   // Auto-generate starters when formation or roster changes
+  // BUT: skip if we've already hydrated a saved lineup from backend that maps to real roster players
   useEffect(() => {
     if (roster.length === 0) { setStarterIds(slots.map(() => null)); return; }
+    // Validate hydrated starters against current roster
+    const rosterIds = new Set(roster.map((p) => p.id));
+    const validHydrated = lineupHydrated.current && starterIds.some((x) => x && rosterIds.has(x));
+    if (validHydrated) {
+      // Sanitize: drop unknown IDs (keep valid ones), fill rest via auto
+      const cleaned: (string | null)[] = slots.map((_, i) => {
+        const id = starterIds[i];
+        return id && rosterIds.has(id) ? id : null;
+      });
+      const used = new Set(cleaned.filter(Boolean) as string[]);
+      slots.forEach((slot, i) => {
+        if (cleaned[i]) return;
+        const pool = rosterByRole[slot.role].filter((p) => !used.has(p.id));
+        if (pool.length > 0) { cleaned[i] = pool[0].id; used.add(pool[0].id); }
+      });
+      // Only update if changed to avoid infinite loop
+      const changed = cleaned.some((v, i) => v !== starterIds[i]) || cleaned.length !== starterIds.length;
+      if (changed) setStarterIds(cleaned);
+      return;
+    }
+    // Fresh auto-generation
     const auto: (string | null)[] = [];
     const used = new Set<string>();
     slots.forEach((slot) => {
@@ -164,17 +268,21 @@ export default function Lineup() {
   const parts = formation.split('-');
 
   const openSubSheet = (slotIndex: number) => {
+    if (isLocked) return;
+    setBenchQuery('');
     setSheetSlot(slotIndex);
     setSheetMode('sub');
     setSheetOpen(true);
   };
   const openBrowseSheet = () => {
+    setBenchQuery('');
     setSheetSlot(null);
     setSheetMode('browse');
     setSheetOpen(true);
   };
 
   const performSwap = (newPlayerId: string, slotIndex: number) => {
+    if (isLocked) return;
     // If newPlayer is already a starter elsewhere → swap positions
     const next = [...starterIds];
     const currentInSlot = next[slotIndex];
@@ -189,7 +297,8 @@ export default function Lineup() {
   };
 
   const chipTapAction = (slotIndex: number) => {
-    // Long-press → open player detail; short-press → substitute
+    // Long-press → open player detail; short-press → substitute (blocked when locked)
+    if (isLocked) return;
     openSubSheet(slotIndex);
   };
 
@@ -199,6 +308,20 @@ export default function Lineup() {
     const targetRole = slots[sheetSlot].role;
     return benchByRole[targetRole];
   }, [sheetSlot, benchByRole, slots]);
+
+  // Filter helper for the bench sheet search bar
+  const normQuery = benchQuery.trim().toLowerCase();
+  const matchesQuery = useCallback(
+    (p: P) => !normQuery || p.name.toLowerCase().includes(normQuery) || (p.team || '').toLowerCase().includes(normQuery),
+    [normQuery]
+  );
+  const filteredSubCandidates = useMemo(() => subCandidates.filter(matchesQuery), [subCandidates, matchesQuery]);
+  const filteredBenchByRole = useMemo(() => {
+    const out: Record<SlotRole, P[]> = { P: [], D: [], C: [], A: [] };
+    (Object.keys(benchByRole) as SlotRole[]).forEach((r) => { out[r] = benchByRole[r].filter(matchesQuery); });
+    return out;
+  }, [benchByRole, matchesQuery]);
+  const filteredBenchTotal = Object.values(filteredBenchByRole).reduce((s, a) => s + a.length, 0);
 
   if (loading) {
     return (
@@ -212,10 +335,52 @@ export default function Lineup() {
     <SafeAreaView style={styles.root} edges={['top']} testID="lineup-screen">
       <View style={styles.header}>
         <Text style={styles.title}>Formazione</Text>
-        <View style={styles.formationSummary}>
-          <Text style={styles.formationText}>{parts[0]}-{parts[1]}-{parts[2]}</Text>
+        <View style={styles.headerRight}>
+          {saveState === 'saving' && (
+            <View style={styles.saveBadge} testID="lineup-saving">
+              <ActivityIndicator size="small" color={theme.colors.brandSecondary} />
+              <Text style={styles.saveBadgeText}>Salvo…</Text>
+            </View>
+          )}
+          {saveState === 'saved' && !isLocked && (
+            <View style={[styles.saveBadge, styles.saveBadgeOk]} testID="lineup-saved">
+              <Ionicons name="checkmark-circle" size={14} color={theme.colors.success} />
+              <Text style={[styles.saveBadgeText, { color: theme.colors.success }]}>Salvata</Text>
+            </View>
+          )}
+          {saveState === 'error' && (
+            <View style={[styles.saveBadge, styles.saveBadgeErr]} testID="lineup-save-err">
+              <Ionicons name="alert-circle" size={14} color={theme.colors.error} />
+              <Text style={[styles.saveBadgeText, { color: theme.colors.error }]}>Errore</Text>
+            </View>
+          )}
+          <View style={styles.formationSummary}>
+            <Text style={styles.formationText}>{parts[0]}-{parts[1]}-{parts[2]}</Text>
+          </View>
         </View>
       </View>
+
+      {/* Lock banner / kickoff countdown */}
+      {(kickoffAt || isLocked) && (
+        <View style={[styles.kickoffBanner, isLocked && styles.kickoffBannerLocked]} testID="lineup-lock-banner">
+          <Ionicons
+            name={isLocked ? 'lock-closed' : 'time-outline'}
+            size={16}
+            color={isLocked ? theme.colors.error : theme.colors.warning}
+          />
+          <Text style={[styles.kickoffBannerText, isLocked && { color: theme.colors.error }]}>
+            {isLocked
+              ? `Formazione bloccata — Giornata ${matchday ?? ''}`
+              : `Blocco tra ${formatCountdown((lockAt?.getTime() ?? 0) - now)} · Kickoff ${kickoffAt ? kickoffAt.toLocaleString('it-IT', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''}`}
+          </Text>
+        </View>
+      )}
+      {saveError && !isLocked && (
+        <View style={[styles.kickoffBanner, styles.kickoffBannerLocked]}>
+          <Ionicons name="warning" size={16} color={theme.colors.error} />
+          <Text style={[styles.kickoffBannerText, { color: theme.colors.error }]}>{saveError}</Text>
+        </View>
+      )}
 
       {/* Formation picker */}
       <View style={styles.formPicker}>
@@ -357,6 +522,27 @@ export default function Lineup() {
               </Pressable>
             </View>
 
+            {/* Search bar */}
+            <View style={styles.searchBar}>
+              <Ionicons name="search" size={16} color={theme.colors.onSurfaceSecondary} />
+              <TextInput
+                testID="bench-search"
+                style={styles.searchInput}
+                placeholder="Cerca giocatore o squadra…"
+                placeholderTextColor={theme.colors.onSurfaceSecondary}
+                value={benchQuery}
+                onChangeText={setBenchQuery}
+                autoCorrect={false}
+                autoCapitalize="none"
+                returnKeyType="search"
+              />
+              {benchQuery.length > 0 && (
+                <Pressable onPress={() => setBenchQuery('')} hitSlop={8} testID="bench-search-clear">
+                  <Ionicons name="close-circle" size={18} color={theme.colors.onSurfaceSecondary} />
+                </Pressable>
+              )}
+            </View>
+
             {sheetMode === 'sub' && sheetSlot != null ? (
               <ScrollView
                 contentContainerStyle={styles.sheetList}
@@ -381,15 +567,19 @@ export default function Lineup() {
                     </View>
                   </View>
                 )}
-                <Text style={styles.sectionLabel}>Riserve stesso ruolo ({subCandidates.length})</Text>
-                {subCandidates.length === 0 ? (
+                <Text style={styles.sectionLabel}>
+                  {normQuery ? `Risultati "${benchQuery}" (${filteredSubCandidates.length})` : `Riserve stesso ruolo (${subCandidates.length})`}
+                </Text>
+                {filteredSubCandidates.length === 0 ? (
                   <View style={styles.emptyBox}>
                     <Ionicons name="information-circle-outline" size={20} color={theme.colors.onSurfaceSecondary} />
                     <Text style={styles.emptyText}>
-                      Nessuna riserva {roleLabels[slots[sheetSlot].role]} in rosa. Compra dal Mercato.
+                      {normQuery
+                        ? `Nessun risultato per "${benchQuery}"`
+                        : `Nessuna riserva ${roleLabels[slots[sheetSlot].role]} in rosa. Compra dal Mercato.`}
                     </Text>
                   </View>
-                ) : subCandidates.map((p) => (
+                ) : filteredSubCandidates.map((p) => (
                   <BenchRow
                     key={p.id}
                     player={p}
@@ -404,7 +594,7 @@ export default function Lineup() {
                 showsVerticalScrollIndicator={false}
               >
                 {(['P', 'D', 'C', 'A'] as SlotRole[]).map((r) => {
-                  const arr = benchByRole[r];
+                  const arr = filteredBenchByRole[r];
                   if (arr.length === 0) return null;
                   return (
                     <View key={r} style={{ marginBottom: 12 }}>
@@ -429,10 +619,14 @@ export default function Lineup() {
                     </View>
                   );
                 })}
-                {totalBench === 0 && (
+                {filteredBenchTotal === 0 && (
                   <View style={styles.emptyBox}>
-                    <Ionicons name="cart-outline" size={20} color={theme.colors.onSurfaceSecondary} />
-                    <Text style={styles.emptyText}>La tua panchina è vuota. Compra giocatori dal Mercato.</Text>
+                    <Ionicons name={normQuery ? 'search-outline' : 'cart-outline'} size={20} color={theme.colors.onSurfaceSecondary} />
+                    <Text style={styles.emptyText}>
+                      {normQuery
+                        ? `Nessun risultato per "${benchQuery}"`
+                        : 'La tua panchina è vuota. Compra giocatori dal Mercato.'}
+                    </Text>
                   </View>
                 )}
               </ScrollView>
@@ -444,8 +638,7 @@ export default function Lineup() {
   );
 }
 
-function BenchRow({ player, onPick, onDetail }: { player: P; onPick: () => void; onDetail: () => void }) {
-  return (
+function BenchRow({ player, onPick, onDetail }: { player: P; onPick: () => void; onDetail: () => void }) {  return (
     <View style={styles.benchRow} testID={`bench-row-${player.id}`}>
       <Pressable onPress={onDetail} hitSlop={4} style={{ flex: 1 }}>
         <Text style={styles.benchRowName} numberOfLines={1}>{player.name}</Text>
@@ -476,6 +669,39 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1, borderBottomColor: theme.colors.divider,
   },
   title: { color: theme.colors.onSurface, fontSize: 22, fontWeight: '800', letterSpacing: -0.5 },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  saveBadge: {
+    flexDirection: 'row', alignItems: 'center', gap: 4,
+    paddingHorizontal: 8, paddingVertical: 4,
+    borderRadius: theme.radius.pill,
+    backgroundColor: theme.colors.surfaceSecondary,
+    borderWidth: 1, borderColor: theme.colors.border,
+  },
+  saveBadgeOk: { borderColor: theme.colors.success + '55', backgroundColor: theme.colors.success + '15' },
+  saveBadgeErr: { borderColor: theme.colors.error + '55', backgroundColor: theme.colors.error + '15' },
+  saveBadgeText: { color: theme.colors.onSurfaceSecondary, fontSize: 11, fontWeight: '700' },
+  kickoffBanner: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: theme.spacing.md, paddingVertical: 8,
+    backgroundColor: 'rgba(245,158,11,0.10)',
+    borderBottomWidth: 1, borderBottomColor: 'rgba(245,158,11,0.35)',
+  },
+  kickoffBannerLocked: {
+    backgroundColor: 'rgba(220,38,38,0.10)',
+    borderBottomColor: 'rgba(220,38,38,0.35)',
+  },
+  kickoffBannerText: { color: theme.colors.warning, fontSize: 12, fontWeight: '700', flex: 1 },
+  searchBar: {
+    flexDirection: 'row', alignItems: 'center', gap: 8,
+    paddingHorizontal: 12, paddingVertical: 8,
+    borderRadius: theme.radius.pill,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1, borderColor: theme.colors.border,
+    marginBottom: theme.spacing.sm,
+  },
+  searchInput: {
+    flex: 1, color: theme.colors.onSurface, fontSize: 14, paddingVertical: 0,
+  },
   formationSummary: {
     paddingHorizontal: 10, paddingVertical: 5,
     backgroundColor: theme.colors.brandSecondary,

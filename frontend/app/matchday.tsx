@@ -149,8 +149,10 @@ export default function MatchdayScreen() {
     } finally { setWorking(null); }
   };
 
-  const canGoPrev = matchday > 1;
-  const canGoNext = matchday < 38;
+  const startMd = (league as any).start_matchday || 1;
+  const endMd = (league as any).end_matchday || 38;
+  const canGoPrev = matchday > startMd;
+  const canGoNext = matchday < endMd;
 
   if (!league) {
     return (
@@ -159,8 +161,6 @@ export default function MatchdayScreen() {
       </SafeAreaView>
     );
   }
-
-  const startMd = (league as any).start_matchday || 1;
 
   return (
     <SafeAreaView style={styles.root} edges={['top']} testID="matchday-screen">
@@ -193,7 +193,7 @@ export default function MatchdayScreen() {
           </Pressable>
           <View style={styles.mdValueBox}>
             <Text style={styles.mdNumber}>{matchday}<Text style={styles.mdOrd}>ª</Text></Text>
-            <Text style={styles.mdCaption}>Giornata (partenza: {startMd}ª)</Text>
+            <Text style={styles.mdCaption}>Giornata (intervallo: {startMd}ª–{endMd}ª)</Text>
           </View>
           <Pressable
             testID="md-next"
