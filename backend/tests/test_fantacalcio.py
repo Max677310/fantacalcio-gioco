@@ -276,3 +276,139 @@ class TestAuction:
                      headers=auth_headers, json={"amount": new_amount})
         assert r.status_code == 200, r.text
         assert r.json()["current_bid"] == new_amount
+
+
+
+# -------------- Kickoff scheduling + Lineup lock (iteration 3) --------------
+from datetime import datetime, timedelta, timezone
+
+
+class TestKickoffLineup:
+    """Regression tests for kickoff scheduling & lineup lock behavior."""
+
+    def test_schedule_kickoff_future_ok(self, api, auth_headers, demo_league):
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        r = api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 1, "kickoff_at": future},
+        )
+        assert r.status_code == 200, r.text
+        league = r.json()
+        assert str(1) in (league.get("matchday_kickoffs") or {})
+
+    def test_get_lineup_returns_kickoff_info(self, api, auth_headers, demo_league):
+        r = api.get(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/lineup?matchday=1",
+            headers=auth_headers,
+        )
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert "kickoff_at" in data and data["kickoff_at"]
+        assert "lock_at" in data and data["lock_at"]
+        assert data.get("locked") is False  # kickoff is 2 days in the future
+
+    def test_save_lineup_ok_when_far_from_kickoff(self, api, auth_headers, demo_league):
+        # Get roster to pick 11 valid starter_ids
+        me = api.get(f"{BASE_URL}/api/auth/me", headers=auth_headers).json()
+        roster = api.get(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/roster/{me['id']}",
+            headers=auth_headers,
+        ).json()
+        players = roster.get("players") or []
+        # Pick players by role for 4-3-3
+        by_role = {"P": [], "D": [], "C": [], "A": []}
+        for p in players:
+            by_role.setdefault(p.get("role"), []).append(p["id"])
+        starter_ids = (
+            by_role.get("P", [None])[:1]
+            + by_role.get("D", [])[:4]
+            + by_role.get("C", [])[:3]
+            + by_role.get("A", [])[:3]
+        )
+        # Pad to 11 with None (allowed by API — starter_ids is List[Optional[str]])
+        while len(starter_ids) < 11:
+            starter_ids.append(None)
+        starter_ids = starter_ids[:11]
+
+        r = api.put(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/lineup",
+            headers=auth_headers,
+            json={"matchday": 1, "formation": "4-3-3", "starter_ids": starter_ids},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["formation"] == "4-3-3"
+
+    def test_save_lineup_locked_when_past_kickoff(self, api, auth_headers, demo_league):
+        # Schedule kickoff 1 minute in the past
+        past = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        r = api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 1, "kickoff_at": past},
+        )
+        assert r.status_code == 200, r.text
+
+        # Now try to save lineup -> should 423
+        r = api.put(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/lineup",
+            headers=auth_headers,
+            json={"matchday": 1, "formation": "4-3-3", "starter_ids": [None] * 11},
+        )
+        assert r.status_code == 423, r.text
+        detail = (r.json() or {}).get("detail", "")
+        assert "bloccata" in detail.lower() or "blocco" in detail.lower() or "kickoff" in detail.lower()
+
+        # Restore future kickoff so other tests aren't affected
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 1, "kickoff_at": future},
+        )
+
+    def test_schedule_kickoff_out_of_range(self, api, auth_headers, demo_league):
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        # 50 is within pydantic bound (<=60) but above the demo league end_matchday (38)
+        r = api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 50, "kickoff_at": future},
+        )
+        assert r.status_code == 400, r.text
+        assert "intervallo" in (r.json() or {}).get("detail", "").lower()
+
+    def test_schedule_kickoff_clear(self, api, auth_headers, demo_league):
+        # Set matchday 2 kickoff then clear it
+        future = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 2, "kickoff_at": future},
+        )
+        r = api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=auth_headers,
+            json={"matchday": 2, "kickoff_at": None},
+        )
+        assert r.status_code == 200
+        league = r.json()
+        assert str(2) not in (league.get("matchday_kickoffs") or {})
+
+    def test_schedule_kickoff_non_admin_forbidden(self, api, demo_league):
+        # Login as a non-admin seeded member
+        r = api.post(
+            f"{BASE_URL}/api/auth/login",
+            json={"email": "mario.rossi@fanta.it", "password": "password123"},
+        )
+        if r.status_code != 200:
+            pytest.skip("Non-admin seed user not available")
+        member_token = r.json()["access_token"]
+        h = {"Authorization": f"Bearer {member_token}", "Content-Type": "application/json"}
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        r = api.post(
+            f"{BASE_URL}/api/leagues/{demo_league['id']}/kickoff/schedule",
+            headers=h,
+            json={"matchday": 3, "kickoff_at": future},
+        )
+        assert r.status_code in (401, 403), r.text

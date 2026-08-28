@@ -34,6 +34,7 @@ dist
 .env
 .env.*
 !.env.example
+!.env.production
 backend/.env
 frontend/.env
 
@@ -86,6 +87,7 @@ memory/test_credentials.md
 # Mobile development
 android-sdk/
 *.env
+!frontend/.env.production
 credentials.json
 *.key
 .credentials

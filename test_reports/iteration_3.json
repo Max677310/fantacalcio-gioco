@@ -1,0 +1,43 @@
+{
+  "summary": "Iteration 3 (kickoff scheduling + lineup lock + API URL validation): Backend regression + 7 new tests for kickoff/lineup PASS (22/24 overall; 2 pre-existing failures unrelated to this change). Frontend flows all verified: login → dashboard (Milano Warriors, code 123456 strip, 'Kickoff in Xh Ym' widget), Formazione tab renders 4-3-3 on the pitch with player names, auto-save fires 'lineup-saved' badge on formation change, 'lineup-lock-banner' shows 'Blocco tra 1g 23h · Kickoff 30 ago, 13:24' (yellow, not locked). Panchina bottom sheet 'bench-open-btn' opens modal with 'bench-search' filtering 15 → 3 rows on query 'ma'. Mercato screen 'mercato-search' filters (Rosa 26 → 'Nessun risultato' on 'lauta'). Lega tab 'kickoff-card' shows 'Kickoff giornata 1' + 'edit-kickoff' opens modal with all 6 presets (+1h/+3h/+6h/Domani/+2g/+1sett), 8 tune buttons (-1g/-1h/-15m/-5m/+5m/+15m/+1h/+1g), Rimuovi/Annulla/Salva; selecting +3h → Salva persists (dashboard then shows 'Kickoff in 2h 59m'). NO 'null is not an object' errors in console. api.ts new URL validation logic is syntactically valid and does not fire against the preview URL (verified locally). Deprecated packages detected: none new; the pre-existing 'props.pointerEvents is deprecated' warning from react-native-web still present. SafeAreaView issues detected: none.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/players", "issue": "Pre-existing regression from an earlier iteration: seed now contains 624 players; the stale iteration-2 assertion `len == 213` fails. Not caused by this iteration's changes — flagged for main agent to either update seed intent or refresh the test expectation."},
+      {"endpoint": "POST /api/auction/{id}/bid", "issue": "Pre-existing: auction returns 'Asta non attiva' (400) in the regression test — the demo league's auction was closed during earlier iterations (or via mercato open toggle). Not caused by kickoff/lineup work."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "react-native-web (transitive dep)", "issue": "Console warning persists: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Non-blocking. Reference: same as iteration_2."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fantacalcio.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Update TestPlayers.test_expected_players to match the current 624-player seed (or restore 213 if the seed change was accidental).",
+    "(Optional) Reopen the demo league auction (POST /api/mercato/close or similar) or wire the auction fixture in tests so the auction regression test doesn't depend on prior state.",
+    "(Nice-to-have) Add testIDs to the bottom tab bar Tabs.Screen entries so browser tests can select them via aria/role instead of navigating via URL."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now ~2815 lines — same monolith concern from iteration_2 still applies. Splitting into routes/{auth,leagues,kickoff,lineup,mercato,auction}.py would greatly help maintainability.",
+    "api.ts URL guard regex `/^https?:\\/\\/[^/]+\\.[a-z]{2,}/i` correctly rejects `https://onrender.com` (no dot after 'onrender'... wait: 'onrender.com' matches [^/]+\\.[a-z]{2,} → 'onrender.com' → PASSES the regex). The explicit `BASE === 'https://onrender.com'` string check is what catches it. If the user picks any other invalid subdomain (e.g. https://fake.example) the URL guard will let it through and only the JSON-parse guard downstream will fire. Consider tightening (e.g. checking response ok or content-type) but acceptable for MVP.",
+    "KickoffScheduleIn Pydantic validator limits matchday to <=60 (so a value like 100 returns 422 not 400). The custom in-handler check `matchday < start_md or > end_md` therefore only triggers when the pydantic bound is respected; both are valid rejections in practice.",
+    "Backend uses `LINEUP_LOCK_MINUTES = 5` module constant — good; 423 Locked with Italian detail 'Formazione bloccata…' is returned as required."
+  ],
+  "updated_files": ["/app/backend/tests/test_fantacalcio.py"],
+  "success_rate": {
+    "backend": "91.6% (22/24 — 7/7 new kickoff/lineup tests pass; 2 pre-existing unrelated failures)",
+    "frontend": "100% on requested flows (login, dashboard, formazione, auto-save, bench-search, mercato-search, kickoff-card + edit-kickoff modal + kickoff-save, lineup-lock-banner)"
+  },
+  "seed_data_creation": "None. Kickoff schedule for matchday 1 was set to a future timestamp during tests; a follow-up test restores it. The +3h UI test also updated the schedule (visible as 'Kickoff in 2h 59m' on dashboard) — main agent may re-run a schedule POST if a specific value is desired.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend base URL: EXPO_PUBLIC_BACKEND_URL from /app/frontend/.env (currently https://auction-dashboard-9.preview.emergentagent.com). Kickoff/lineup endpoints: POST /api/leagues/{id}/kickoff/schedule (admin, body {matchday, kickoff_at ISO or null}, returns updated League); GET /api/leagues/{id}/lineup?matchday=N returns {matchday, formation, starter_ids, locked, lock_at, kickoff_at}; PUT /api/leagues/{id}/lineup returns 423 when now >= kickoff-5min with detail starting 'Formazione bloccata'. Key testIDs for lineup screen: lineup-screen, lineup-lock-banner, lineup-saved / lineup-saving / lineup-save-err, formation-chip-{4-3-3,3-4-3,3-5-2,4-4-2,4-5-1,5-3-2,5-4-1}, bench-open-btn, bench-sheet, bench-sheet-close, bench-search, bench-search-clear, bench-row-{playerId}, bench-pick-{playerId}. Lega kickoff modal testIDs: kickoff-card, edit-kickoff, kickoff-preset-{+1h,+3h,+6h,Domani,+2g,+1sett}, kickoff-tune-{-1g,-1h,-15m,-5m,+5m,+15m,+1h,+1g}, kickoff-clear, kickoff-cancel, kickoff-save. Mercato: mercato-search, mercato-search-clear. To reach non-dashboard tabs from playwright, navigate directly to /lineup, /mercato, /league — the bottom-tab role selector doesn't resolve reliably.",
+  "rca_of_issue": "N/A — feature works as designed. api.ts change is safe: both new guards (URL validation + JSON-parse guard) only fire on misconfiguration; the preview URL flows through unchanged, and all API integrations continue to work. The 2 failing backend tests are pre-existing (player seed count drift + auction-closed state) and unrelated to this iteration's scope."
+}

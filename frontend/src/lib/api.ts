@@ -13,9 +13,29 @@ async function request<T>(path: string, init: RequestInit = {}, auth = true): Pr
     const t = await getToken();
     if (t) headers.Authorization = `Bearer ${t}`;
   }
+  if (!BASE || BASE === 'https://onrender.com' || !/^https?:\/\/[^/]+\.[a-z]{2,}/i.test(BASE)) {
+    // Fail fast with a clear message when EXPO_PUBLIC_BACKEND_URL is missing or is
+    // the generic Render landing page URL (a common self-hosting misconfiguration).
+    throw new Error(
+      `Configurazione: EXPO_PUBLIC_BACKEND_URL non valido ("${BASE || 'vuoto'}"). ` +
+      `Su Render usa l'URL completo del TUO servizio (es: https://fantacalcio-backend-xyz.onrender.com), ` +
+      `non la homepage generica https://onrender.com.`
+    );
+  }
   const res = await fetch(`${BASE}/api${path}`, { ...init, headers });
   const text = await res.text();
-  const data = text ? JSON.parse(text) : null;
+  // Guard against non-JSON responses (e.g. Render homepage HTML when URL is wrong)
+  let data: any = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(
+        `Il backend all'URL "${BASE}" non risponde con JSON — probabilmente EXPO_PUBLIC_BACKEND_URL punta al servizio sbagliato. ` +
+        `Verifica di aver copiato l'URL esatto del tuo Web Service Render.`
+      );
+    }
+  }
   if (!res.ok) {
     const msg = (data && (data.detail || data.message)) || `Errore ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg));
